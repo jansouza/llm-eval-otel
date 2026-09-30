@@ -1,0 +1,74 @@
+[project]
+name = "llm-eval-otel"
+dynamic = ["version"]
+description = "Out-of-band evaluator for GenAI spans in an OpenTelemetry pipeline"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.54.0",
+    "pydantic-settings==2.15.0",
+    "opentelemetry-api==1.45.0",
+    "opentelemetry-sdk==1.45.0",
+    "opentelemetry-proto==1.45.0",
+    "opentelemetry-exporter-otlp-proto-http==1.45.0",
+]
+
+[project.scripts]
+llm-eval-otel = "llm_eval_otel.main:run"
+
+[project.entry-points."llm_eval.evaluators"]
+pii_detection = "llm_eval_otel.evaluators.pii:PIIDetector"
+secret_detection = "llm_eval_otel.evaluators.secrets:SecretDetector"
+refusal = "llm_eval_otel.evaluators.refusal:RefusalDetector"
+system_prompt_leak = "llm_eval_otel.evaluators.prompt_leak:SystemPromptLeakDetector"
+output_format = "llm_eval_otel.evaluators.output_format:OutputFormatValidator"
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.9",
+    "types-protobuf==7.35.1.20260906",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/llm_eval_otel/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_eval_otel"]
+
+[tool.uv]
+# The version lives in version.py: rebuild the package metadata when it changes.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/llm_eval_otel/version.py" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["docs", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+mypy_path = "src"
+packages = ["llm_eval_otel"]
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry.proto.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests/unit"]
+markers = ["e2e: end-to-end test that needs docker compose"]

@@ -23,16 +23,25 @@ For every evaluated span, and for each evaluator, it emits:
   You can turn it off with `LLM_EVAL_EMIT_SPANS=false`.
 - Two metrics: `llm_eval.evaluations` (counter) and `llm_eval.evaluation.score` (histogram).
 
-Two evaluators ship with the service:
+Five evaluators ship with the service. All are local heuristics with no model. The first two are
+on by default. The other three are opt-in through `LLM_EVAL_EVALUATORS`:
 
-| Evaluator | Detects |
-| --- | --- |
-| `pii_detection` | CPF (check digits validated), e-mail, credit cards (brand prefix, length and Luhn) |
-| `secret_detection` | AWS access keys, GitHub tokens, LLM API keys (`sk-…`), JWTs, private keys, connection strings with a password, high-entropy values assigned to `key`/`token`/`secret`/`password`/`senha` |
+| Evaluator | Default | Detects |
+| --- | --- | --- |
+| `pii_detection` | on | CPF and CNPJ, numeric or alphanumeric (check digits validated), e-mail, credit cards (brand prefix, length and Luhn), Brazilian phone numbers (valid DDD), PIX random keys (a UUID v4 with "pix" nearby) |
+| `secret_detection` | on | AWS access keys, GitHub tokens, LLM API keys (`sk-…`), JWTs, private keys, connection strings with a password, high-entropy values assigned to `key`/`token`/`secret`/`password`/`senha` |
+| `refusal` | opt-in | Responses in which the model declines the request, in Portuguese, English or Spanish, and provider refusals (`finish_reason=content_filter`) |
+| `system_prompt_leak` | opt-in | Responses that copy stretches of the system instructions (word 8-gram overlap) |
+| `output_format` | opt-in | Invalid JSON when the client asked for JSON (`gen_ai.output.type=json`) |
 
-No raw sensitive value leaves the service. Explanations carry only types, counts and where they
-appeared (`cpf=1 (input), email=2 (output)`). A sanitizer also re-scans every string attribute
-before it reaches the SDK, and the service's own logs never include message content.
+No raw sensitive value leaves the service. Explanations carry only types, counts, numbers and
+where they appeared (`cpf=1 (input), email=2 (output)`). A sanitizer also re-scans every string
+attribute before it reaches the SDK, and the service's own logs never include message content.
+
+**Phone numbers are detected since 0.2.0.** Support chatbots often handle phone numbers, so
+`pii_detection` may report more `fail` results after an upgrade. To turn off one type without
+exempting the whole evaluator, set `LLM_EVAL_PII_TYPES`. For example,
+`LLM_EVAL_PII_TYPES=cpf,cnpj,email,credit_card,pix_key` leaves out `phone`.
 
 ## Quick start
 
@@ -46,7 +55,8 @@ The stack has four containers:
 
 - `span-generator`: sends synthetic GenAI spans every 30 s. The cases are clean text, PII, a
   credential, a credential in a tool flow, a three-turn conversation, an exempt service, the
-  OpenLLMetry format and a non-GenAI span.
+  OpenLLMetry format, CNPJ/phone/PIX, a refusal, a leak of the system instructions, valid and
+  truncated JSON output, and a non-GenAI span. The demo enables all five evaluators.
 - `otel-collector`: runs the config in [deploy/otel-collector-config.yaml](deploy/otel-collector-config.yaml).
 - `llm-eval-otel`: this service.
 - `backend`: [`grafana/otel-lgtm`](https://github.com/grafana/docker-otel-lgtm), which bundles
@@ -73,6 +83,12 @@ The service can only evaluate what reaches it:
 3. **Your backend needs to show linked log records.** The evaluation event is a log record linked
    to the trace. If your trace UI does not show linked logs, rely on the child span, which is on
    by default.
+4. **Two evaluators need more than messages.** `system_prompt_leak` needs the system
+   instructions on the span, in `gen_ai.system_instructions` or as a `system` message, with at
+   least 30 words. `output_format` needs `gen_ai.output.type`. With OpenLLMetry, it reads
+   `gen_ai.request.structured_output_schema` instead, which OpenLLMetry records when the client
+   asks for structured output. When a span lacks this data, the evaluator does not apply and
+   emits nothing.
 
 ## Using it with a real application
 
@@ -111,10 +127,43 @@ To add the ports to the compose demo, publish `4317`/`4318` on `otel-collector` 
 - **Output messages:** all of them, including every choice when `n > 1`.
 - **Message parts:** `text` and `reasoning` (`content`), `tool_call` (`arguments`) and
   `tool_call_response` (`response`). Blob, file, URI and server-side tool calls are skipped.
+  `pii_detection` and `secret_detection` scan every part. The other evaluators read only the
+  output parts the user or a tool receives:
+
+  | Evaluator | Reads | Applies when |
+  | --- | --- | --- |
+  | `refusal` | output `text`, first 300 characters of each message; `gen_ai.response.finish_reasons` | there is output text or a finish reason |
+  | `system_prompt_leak` | system instructions; output `text` and `tool_call` | the instructions have 30+ words and there is output text or a tool call |
+  | `output_format` | output `text` | `gen_ai.output.type` is `json` and there is output text |
+
+- **Finish reasons:** `gen_ai.response.finish_reasons`, or, when it is absent, the deprecated
+  `finish_reason` of each output message (OpenLLMetry still writes it) or
+  `gen_ai.completion.{n}.finish_reason`.
 
 Only spans with `gen_ai.operation.name` of `chat`, `text_completion` or `generate_content` are
 evaluated, plus OpenLLMetry spans that carry content. Anything else is counted in
 `llm_eval.spans.skipped` with its reason.
+
+### Reading the results
+
+- **`pii_detection`, `secret_detection`:** score `0.0` and `fail` when anything is found,
+  `1.0` and `pass` otherwise. When one stretch of text matches two PII types, it counts once, in
+  this order: CPF, CNPJ, card, phone.
+- **`refusal`:** `fail` means the model refused, not that it misbehaved: refusing an abusive
+  request is correct. Read it as a refusal rate per model and service. A phrase counts only
+  with a refusal verb and an object ("não posso ajudar com", "I can't assist with") in the
+  first 300 characters. Partial refusals and other languages are not detected.
+  Explanation: `refusal=1 (output), source=phrase, lang=pt`.
+- **`system_prompt_leak`:** score is `1 - coverage`. The label is `fail` when 20 or more words
+  are copied in a row, or coverage is above 0.15, so a long copied run can fail with a high
+  score. Both thresholds are initial values. Paraphrases and translations are not detected. If
+  a service's instructions hold text the model must repeat (an FAQ, standard replies), exempt it
+  in `LLM_EVAL_EXCEPTIONS`. Explanation: `coverage=0.42, longest_run=37 words (output)`.
+- **`output_format`:** score is the share of outputs that parse as JSON. Markdown fences are
+  not stripped, because a fence means JSON mode was not honored. Only syntax is checked: the
+  semconv has no attribute with the requested schema. The explanation gives the parser's
+  message and position, never the text: `invalid_json=1 of 2 (output): Expecting ','
+  delimiter at char 132`, plus `finish_reason=length` when the output was cut off.
 
 ## Configuration
 
@@ -126,9 +175,11 @@ evaluated, plus OpenLLMetry spans that carry content. Anything else is counted i
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4319` | Collector receiver reserved for evaluator output |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | Export protocol |
 | `LLM_EVAL_HTTP_PORT` | `4318` | OTLP/HTTP receiver and health endpoints |
-| `LLM_EVAL_EVALUATORS` | `pii_detection,secret_detection` | Enabled evaluators, comma-separated |
+| `LLM_EVAL_EVALUATORS` | `pii_detection,secret_detection` | Enabled evaluators, comma-separated; also available: `refusal`, `system_prompt_leak`, `output_format` |
+| `LLM_EVAL_PII_TYPES` | `cpf,cnpj,email,credit_card,phone,pix_key` | Types `pii_detection` reports; the sanitizer always redacts all of them |
 | `LLM_EVAL_SAMPLE_RATES` | empty | Per-evaluator sample rate override, e.g. `relevance=0.05` |
 | `LLM_EVAL_EXCEPTIONS` | empty | JSON `service → [evaluators]` exempted per service |
+| `LLM_EVAL_ASSOCIATION_EXCLUDE` | `correlation_id` | Association property keys kept off the metrics, comma-separated |
 | `LLM_EVAL_WORKERS` | `4` | Asyncio workers draining the queue; they help evaluators that wait on I/O |
 | `LLM_EVAL_QUEUE_MAX` | `10000` | Queued interactions before answering 429 |
 | `LLM_EVAL_TIMEOUT_S` | `5` | Default per-evaluator timeout |
@@ -247,14 +298,20 @@ define use the `llm_eval.*` prefix, so they cannot collide with future `gen_ai.*
 | `gen_ai.response.id`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model` | copied from the evaluated span |
 | `error.type` | `timeout` (only on failure) |
 | `llm_eval.source.service.name` | `service.name` of the app that produced the span |
+| `traceloop.association.properties.*` | copied from the evaluated span (OpenLLMetry), e.g. `scenario` |
 | `llm_eval.evaluation.type` | `heuristic`, `model` or `llm_judge` |
 | `llm_eval.pii.types`, `llm_eval.secret.types` | `["cpf", "email"]` |
+| `llm_eval.refusal.source` | `phrase` or `finish_reason` |
+| `llm_eval.refusal.language` | `pt`, `en` or `es` (only with `source=phrase`) |
+| `llm_eval.prompt_leak.coverage` | `0.42`: share of the instructions' 8-grams found in the output |
+| `llm_eval.prompt_leak.longest_run` | `37`: longest run of copied words |
+| `llm_eval.output_format.error` | `syntax`, `empty` or `truncated` (syntax error with `finish_reason=length`) |
 | `llm_eval.content.truncated` | `true` when the evaluator's `max_chars` cut the text |
 
 | Metric | Type | Attributes |
 | --- | --- | --- |
-| `llm_eval.evaluations` | Counter | evaluation name, label, `error.type`, source service, provider, model |
-| `llm_eval.evaluation.score` | Histogram (0.1 … 1.0) | evaluation name, source service, provider, model; excludes exempt and errors |
+| `llm_eval.evaluations` | Counter | evaluation name, label, `error.type`, source service, provider, model, association properties |
+| `llm_eval.evaluation.score` | Histogram (0.1 … 1.0) | evaluation name, source service, provider, model, association properties; excludes exempt and errors |
 | `llm_eval.evaluation.duration` | Histogram, `s` | evaluation name, `error.type` |
 | `llm_eval.spans.received` | Counter | none |
 | `llm_eval.spans.skipped` | Counter | `llm_eval.skip.reason`: `not_inference`, `no_content`, `duplicate`, `invalid_payload` |
@@ -262,21 +319,30 @@ define use the `llm_eval.*` prefix, so they cannot collide with future `gen_ai.*
 | `llm_eval.sanitizer.redactions` | Counter | evaluation name |
 
 Metric attributes never include TraceID, SpanID, response IDs or free text, which keeps
-cardinality low. `service.version` on the resource identifies the version of the detection
+cardinality low. Association properties go on the metrics with the same names as on the
+application's own OpenLLMetry metrics, so both can be filtered by the same key. Keys whose
+value changes per request (a correlation or session ID) create one series per request: list
+them in `LLM_EVAL_ASSOCIATION_EXCLUDE`. The event and the span keep every property.
+The sanitizer also covers the properties, so a value that is PII shows up as `[REDACTED]`. `service.version` on the resource identifies the version of the detection
 rules.
 
 ## Performance
 
-Measured with `uv run python tools/load_test.py --spans 3000 --text-kb 10` on 2026-09-29. The
-machine had 8 cores, and the test ran one process with 4 workers. Each span carried 10 KB of
-text with some PII and credentials mixed in. The throughput run used the real HTTP server and
-counted exported events at a local fake Collector.
+Measured with `uv run python tools/load_test.py --spans 3000 --text-kb 10` on 2026-09-30,
+version 0.2.0. The machine had 8 cores, and the test ran one process with 4 workers. Each span
+carried 10 KB of text with some PII and credentials mixed in. Each evaluator got 10 KB of what
+it reads; `system_prompt_leak` compared 10 KB of instructions with 10 KB of output. The
+throughput run used the real HTTP server with the default evaluators and counted exported
+events at a local fake Collector.
 
 | Measure | Target | Measured |
 | --- | --- | --- |
-| `pii_detection` p99, 10 KB | ≤ 5 ms | 1.70 ms (p50 1.28 ms) |
-| `secret_detection` p99, 10 KB | ≤ 5 ms | 2.32 ms (p50 1.85 ms) |
-| Throughput per process, both evaluators | ≥ 100 spans/s | 220 spans/s |
+| `pii_detection` p99, 10 KB | ≤ 5 ms | 2.04 ms (p50 1.55 ms) |
+| `secret_detection` p99, 10 KB | ≤ 5 ms | 3.74 ms (p50 1.90 ms) |
+| `refusal` p99, 10 KB | ≤ 5 ms | 0.29 ms (p50 0.18 ms) |
+| `system_prompt_leak` p99, 10 KB + 10 KB | ≤ 5 ms | 2.31 ms (p50 1.83 ms) |
+| `output_format` p99, 10 KB | ≤ 5 ms | 0.20 ms (p50 0.14 ms) |
+| Throughput per process, `pii_detection` + `secret_detection` | ≥ 100 spans/s | 194 spans/s |
 
 Typical chat spans carry less than 10 KB of new content, so expect more throughput in practice.
 Add replicas to scale.
@@ -303,12 +369,25 @@ src/llm_eval_otel/
   engine/queue.py      # bounded queue, dedup, workers
   engine/runner.py     # sampling, timeouts, exemptions, truncation
   engine/service.py    # wires the pieces together
-  evaluators/          # base (the contract), pii, secrets, registry (entry points)
+  evaluators/          # base (the contract), pii, secrets, refusal, prompt_leak,
+                       # output_format, registry (entry points)
+  version.py           # the version, also service.version
   emit/                # sdk (providers), emitter (event, span, metrics), sanitize
 tools/span_generator.py  # synthetic spans for the demo
 tools/load_test.py       # latency and throughput measurement
 deploy/                  # Collector config and docker compose
 ```
+
+### Versioning
+
+The version lives only in `src/llm_eval_otel/version.py`; `pyproject.toml` reads it from there.
+It is the `service.version` on all the service's telemetry, so it tells which detection rules
+produced a result. Bump the minor version when what gets detected changes (a new type,
+evaluator or threshold) and the patch version for fixes that don't change detection. Add the
+change to [CHANGELOG.md](CHANGELOG.md).
+
+To release, edit `version.py`, merge, and push a matching tag (`git tag v0.2.0 && git push
+origin v0.2.0`). The release workflow fails if the tag and `version.py` differ.
 
 ## Known limits
 
