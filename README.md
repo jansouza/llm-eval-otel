@@ -30,7 +30,9 @@ trace, an `evaluate {name}` child span (optional) and metrics. See the
 | `output_format` | opt-in | Invalid JSON when the client asked for JSON |
 | `relevance` | opt-in | Off-topic answers, rated by an LLM judge (OpenAI or any compatible server) on 5% of traces |
 
-Enable them by name in `LLM_EVAL_EVALUATORS`. What each one reads, how to read its results and
+Enable them by name in `LLM_EVAL_EVALUATORS`. `relevance` is the only one that checks answer
+quality rather than safety; it needs a judge model, so it stays opt-in (see
+[Configuration](#configuration) to turn it on). What each one reads, how to read its results and
 how to write your own: [docs/evaluators.md](docs/evaluators.md).
 
 **No raw sensitive value leaves the service.** Explanations carry only types, counts and
@@ -95,7 +97,7 @@ The most used variables; the full list is in [docs/configuration.md](docs/config
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4319` | Collector receiver reserved for evaluator output |
-| `LLM_EVAL_EVALUATORS` | `pii_detection,secret_detection` | Enabled evaluators, comma-separated |
+| `LLM_EVAL_EVALUATORS` | `pii_detection,secret_detection` | Enabled evaluators, comma-separated; add `relevance` to turn on the LLM judge |
 | `LLM_EVAL_EXCEPTIONS` | empty | JSON `service → [evaluators]` exempted per service, e.g. `{"bank-chatbot": ["pii_detection"]}` |
 | `LLM_EVAL_SAMPLE_RATES` | empty | Per-evaluator sample rate, e.g. `relevance=0.05` |
 | `LLM_EVAL_AUTH_TOKEN` | empty | When set, requires `Authorization: Bearer <token>` |
