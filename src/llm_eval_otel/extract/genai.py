@@ -30,7 +30,12 @@ _LLM_REQUEST_TYPE = "llm.request.type"
 _REQUEST_TYPE_TO_OPERATION = {"chat": "chat", "completion": "text_completion"}
 
 _SYSTEM = "system"
-_ASSISTANT = "assistant"
+_ASSISTANT = semconv.ROLE_ASSISTANT
+_CONTEXT_ROLES = frozenset({semconv.ROLE_USER, semconv.ROLE_ASSISTANT})
+
+# Earlier turns kept as context for judges: the last few text messages, each capped.
+CONTEXT_MAX_MESSAGES = 4
+CONTEXT_MAX_CHARS = 1_000
 
 
 @dataclass
@@ -130,12 +135,33 @@ def _semconv_system_instructions(value: Any) -> list[Message]:
     return [message] if message else []
 
 
-def new_in_turn(messages: list[Message]) -> list[Message]:
-    """Messages after the last assistant message; all of them when there is none."""
+def _turn_start(messages: list[Message]) -> int:
     last_assistant = max(
         (index for index, m in enumerate(messages) if m.role == _ASSISTANT), default=-1
     )
-    return messages[last_assistant + 1 :]
+    return last_assistant + 1
+
+
+def new_in_turn(messages: list[Message]) -> list[Message]:
+    """Messages after the last assistant message; all of them when there is none."""
+    return messages[_turn_start(messages) :]
+
+
+def context_before_turn(messages: list[Message]) -> list[Message]:
+    """The last user/assistant text messages before the turn, text parts only, each capped.
+
+    Tool calls and tool results are left out: a judge needs the conversation, not the
+    agent's steps.
+    """
+    context: list[Message] = []
+    for message in reversed(messages[: _turn_start(messages)]):
+        if len(context) == CONTEXT_MAX_MESSAGES:
+            break
+        if message.role not in _CONTEXT_ROLES:
+            continue
+        if text := message.text_of(semconv.PART_TEXT)[:CONTEXT_MAX_CHARS]:
+            context.append(Message(message.role, text))
+    return context[::-1]
 
 
 def _split_system(messages: list[Message]) -> tuple[list[Message], list[Message]]:
@@ -153,6 +179,7 @@ class _Content:
     # Per-output finish reasons found in the messages themselves; used only when the
     # span has no gen_ai.response.finish_reasons.
     finish_reasons: tuple[str, ...] = ()
+    context: list[Message] = field(default_factory=list)
 
 
 def _from_semconv(attrs: Mapping[str, Any]) -> _Content:
@@ -172,6 +199,7 @@ def _from_semconv(attrs: Mapping[str, Any]) -> _Content:
         new_in_turn(inputs),
         _semconv_messages(output_items),
         finish_reasons,
+        context_before_turn(inputs),
     )
 
 
@@ -222,7 +250,13 @@ def _from_openllmetry(attrs: Mapping[str, Any]) -> _Content | None:
         for entry in of_kind("completion")
         if (reason := _as_str(entry.get(semconv.MESSAGE_FINISH_REASON)))
     )
-    return _Content(system, new_in_turn(prompts), build("completion"), finish_reasons)
+    return _Content(
+        system,
+        new_in_turn(prompts),
+        build("completion"),
+        finish_reasons,
+        context_before_turn(prompts),
+    )
 
 
 def _operation_name(attrs: Mapping[str, Any]) -> str | None:
@@ -310,10 +344,19 @@ def extract_span(span: Span, service_name: str | None) -> GenAIInteraction | str
         association_properties=_association_properties(attrs),
         output_type=_output_type(attrs),
         finish_reasons=_finish_reasons(attrs, content.finish_reasons),
+        context_messages=content.context,
     )
 
 
-def extract(request: ExportTraceServiceRequest) -> ExtractResult:
+def extract(
+    request: ExportTraceServiceRequest, self_service_name: str | None = None
+) -> ExtractResult:
+    """``self_service_name`` is this service's own ``service.name``.
+
+    Its spans (``evaluate …`` and the judge's ``chat …``) can only arrive here when the
+    Collector routes the evaluator's output back to it by mistake; they are skipped as
+    ``self_telemetry`` instead of being evaluated.
+    """
     result = ExtractResult()
     for resource_spans in request.resource_spans:
         resource_attrs = attributes(resource_spans.resource.attributes)
@@ -321,6 +364,9 @@ def extract(request: ExportTraceServiceRequest) -> ExtractResult:
         for scope_spans in resource_spans.scope_spans:
             for span in scope_spans.spans:
                 result.received += 1
+                if self_service_name is not None and service_name == self_service_name:
+                    result.skipped[semconv.SKIP_SELF_TELEMETRY] += 1
+                    continue
                 outcome = extract_span(span, service_name)
                 if isinstance(outcome, str):
                     result.skipped[outcome] += 1

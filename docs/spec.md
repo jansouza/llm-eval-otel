@@ -14,7 +14,7 @@ Resultado esperado da primeira versão:
 
 - Para cada span de inferência GenAI recebido, um registro de avaliação por avaliador, com o mesmo TraceID e apontando para o SpanID original.
 - Métricas de contagem e distribuição de score por avaliador, exportadas via OTLP.
-- Dois avaliadores locais funcionando, um de PII (CPF, e-mail, cartão de crédito) e um de credenciais expostas (chaves de API, tokens, chaves privadas), e uma interface para plugar toxicidade, jailbreak ou LLM-as-a-judge sem mexer no restante.
+- Dois avaliadores locais funcionando, um de PII (CPF, e-mail, cartão de crédito) e um de credenciais expostas (chaves de API, tokens, chaves privadas), e uma interface para plugar toxicidade, jailbreak ou LLM-as-a-Judge sem mexer no restante.
 - Nenhum valor sensível bruto em atributo, evento, métrica ou log do próprio serviço.
 
 ## Escopo
@@ -34,7 +34,7 @@ A v0.1 cobre ingestão OTLP/HTTP, dois avaliadores locais (PII e credenciais) e 
 **Fica fora da v0.1**
 
 - Bloquear ou alterar a resposta ao usuário. O serviço roda depois do fato, então só sinaliza, com label `fail`.
-- Avaliadores baseados em modelo ou em LLM, como toxicidade, jailbreak e LLM-as-a-judge. A ordem de entrada está em Roadmap de avaliadores.
+- Avaliadores baseados em modelo ou em LLM, como toxicidade, jailbreak e LLM-as-a-Judge. A ordem de entrada está em Roadmap de avaliadores.
 - Conteúdo que chegue como log (`gen_ai.client.inference.operation.details`) em vez de atributo de span, e o formato legado de span events (`gen_ai.content.prompt` e `gen_ai.content.completion`).
 - Partes de mensagem que não são texto, chamada de ferramenta ou raciocínio: blob, arquivo, URI e chamadas de ferramenta do lado do servidor.
 - Spans de agente, ferramenta, embeddings e retrieval.
@@ -153,12 +153,14 @@ O serviço é um pacote Python 3.12 com sete módulos, cada um trocando dados co
 | `ingest` | Receber OTLP/HTTP com protobuf, com ou sem gzip, até `LLM_EVAL_MAX_REQUEST_BYTES`; responder 400 a payload inválido e 429 quando a fila está cheia, para o Collector tentar de novo; servir `/healthz` e `/readyz` | bytes OTLP → `ExportTraceServiceRequest` | FastAPI + uvicorn, `opentelemetry-proto` 1.45 |
 | `extract` | Filtrar spans de inferência, ler o conteúdo novo do turno e preservar TraceID, SpanID, ParentSpanID e flags | `ExportTraceServiceRequest` → `list[GenAIInteraction]` | código próprio |
 | `engine.queue` | Fila limitada, workers e deduplicação por (TraceID, SpanID) contra reenvios do Collector | `GenAIInteraction` → `GenAIInteraction` | `asyncio.Queue`, LRU com TTL |
-| `engine.runner` | Rodar os avaliadores habilitados em paralelo, com timeout, amostragem e exceções por serviço; heurísticas em `asyncio.to_thread`; exceção vira resultado com `error_type` | `GenAIInteraction` → `list[EvaluationResult]` | `asyncio` |
-| `evaluators` | Implementações de avaliador; a v0.1 traz `pii_detection` e `secret_detection`, e a v0.2 acrescenta `refusal`, `system_prompt_leak` e `output_format` | `GenAIInteraction` → `EvaluationResult` | `re`, validação de CPF, bandeira, Luhn e entropia |
+| `engine.runner` | Rodar os avaliadores habilitados em paralelo, com timeout, amostragem e exceções por serviço; heurísticas em `asyncio.to_thread`; juízes oferecidos à faixa de execução; exceção vira resultado com `error_type` | `GenAIInteraction` → `list[EvaluationResult]` | `asyncio` |
+| `engine.lanes` | Faixa de execução dos juízes: fila limitada, chamadas simultâneas limitadas, orçamento de tokens e descarte contado | `Job` → `EvaluationRecord` | `asyncio.Queue` |
+| `evaluators` | Implementações de avaliador; a v0.1 traz `pii_detection` e `secret_detection`, a v0.2 acrescenta `refusal`, `system_prompt_leak` e `output_format`, e a v0.3 acrescenta o juiz `relevance` | `GenAIInteraction` → `EvaluationResult` | `re`, validação de CPF, bandeira, Luhn e entropia |
+| `judge` | Contrato do cliente do juiz, adaptador `openai`, mascaramento antes do envio, validação da saída contra o schema e o registro de cada chamada | conteúdo → `JudgeResponse` | SDK `openai`, API Chat Completions |
 | `emit` | Montar evento, span filho e medições; passar tudo pelo guarda de sanitização antes de chamar o SDK | `EvaluationResult` → chamadas do SDK | `opentelemetry-sdk` 1.45 |
 | `config` | Ler variáveis de ambiente e montar providers do SDK | ambiente → `Settings` | `pydantic-settings` |
 
-**Interface do avaliador.** É o contrato que toxicidade, jailbreak ou LLM-as-a-judge vão implementar. O avaliador não conhece OTel: recebe a interação já extraída e devolve um resultado; quem traduz para telemetria é o `emit`.
+**Interface do avaliador.** É o contrato que toxicidade, jailbreak ou LLM-as-a-Judge vão implementar. O avaliador não conhece OTel: recebe a interação já extraída e devolve um resultado; quem traduz para telemetria é o `emit`.
 
 ```python
 @dataclass(frozen=True)
@@ -181,6 +183,7 @@ class GenAIInteraction:
     input_messages: list[Message]  # só o que é novo no turno
     output_messages: list[Message]
     association_properties: Mapping[str, str]  # traceloop.association.properties.*, sem o prefixo
+    context_messages: list[Message] = []         # até 4 mensagens de texto anteriores ao turno, para juízes
 
 class EvaluatorKind(StrEnum):
     HEURISTIC = "heuristic"
@@ -207,7 +210,7 @@ class Evaluator(Protocol):
 
 Avaliadores são registrados pelo entry point `llm_eval.evaluators` no `pyproject.toml` e habilitados por `LLM_EVAL_EVALUATORS=pii_detection,...`. Um avaliador de terceiros entra instalando o pacote dele, sem alterar este repositório.
 
-O runner chama as heurísticas (`kind = heuristic`) em `asyncio.to_thread`, para que a ingestão e o 429 continuem respondendo enquanto a regex roda. Avaliadores que esperam I/O, como um juiz, rodam direto no event loop. Se `max_chars` estiver definido, o runner corta o texto antes de chamar o avaliador e marca o evento com `llm_eval.content.truncated=true`; as heurísticas não têm limite e varrem o texto inteiro.
+O runner chama as heurísticas (`kind = heuristic`) em `asyncio.to_thread`, para que a ingestão e o 429 continuem respondendo enquanto a regex roda. Avaliadores que esperam I/O rodam direto no event loop. Os juízes (`kind = llm_judge`) não seguram o worker da fila: o runner os oferece à faixa de execução e segue (ver Avaliador `relevance`). Se `max_chars` estiver definido, o runner corta o texto antes de chamar o avaliador, nesta ordem: saída, entrada e instruções de sistema, e marca o evento com `llm_eval.content.truncated=true`; as heurísticas não têm limite e varrem o texto inteiro.
 
 **O que é avaliado em cada span**
 
@@ -222,14 +225,14 @@ Cada span de chat reenvia o histórico da conversa. Com essa regra, um CPF digit
 
 **Amostragem por avaliador**
 
-Cada avaliador declara `sample_rate`, e `LLM_EVAL_SAMPLE_RATES` sobrescreve o valor pelo nome. Heurísticas ficam em 1.0 e rodam em todo span; avaliadores caros, como um LLM-as-a-judge, rodam numa fração dos traces.
+Cada avaliador declara `sample_rate`, e `LLM_EVAL_SAMPLE_RATES` sobrescreve o valor pelo nome. Heurísticas ficam em 1.0 e rodam em todo span; avaliadores caros, como um LLM-as-a-Judge, rodam numa fração dos traces.
 
 | Avaliador | `sample_rate` | Resultado |
 | --- | --- | --- |
 | `pii_detection` | 1.0 (padrão) | 100% dos spans |
 | `secret_detection` | 1.0 (padrão) | 100% dos spans |
 | `refusal`, `system_prompt_leak`, `output_format` | 1.0 (padrão) | 100% dos spans a que se aplicam |
-| `relevance` (LLM-as-a-judge, v0.4) | 0.05 | cerca de 5% dos traces |
+| `relevance` (LLM-as-a-Judge, 0.3.0) | 0.05 | cerca de 5% dos traces |
 
 O sorteio segue a regra do `ProbabilitySampler` do OTel: os 7 bytes finais do TraceID são o valor aleatório `R`, e o avaliador roda quando `R` é maior ou igual ao limiar `T`. Assim a decisão é a mesma em qualquer réplica e em qualquer reenvio, todos os spans de um trace têm o mesmo destino, e uma taxa menor sempre escolhe um subconjunto dos traces de uma taxa maior.
 
@@ -253,6 +256,8 @@ LLM_EVAL_EXCEPTIONS='{"bank-chatbot": ["pii_detection"], "devops-assistant": ["s
 ```
 
 O avaliador roda mesmo assim, e o runner troca o resultado: `gen_ai.evaluation.score.label` vira `exempt`, `gen_ai.evaluation.score.value` não é emitido, e a explicação começa com `exempt service;` seguida do que foi encontrado, por exemplo `exempt service; cpf=2 (input)`, ou `exempt service; no findings`. As métricas separam `exempt` de `pass` e `fail`, e o histograma de score não recebe avaliações liberadas. Assim fica visível quanto dado sensível um serviço liberado envia ao provedor, sem gerar alerta.
+
+Juízes são a exceção: para um serviço liberado, o runner não chama o juiz, porque isso seria pagar e mandar conteúdo para fora sem necessidade. O evento sai com `exempt` e a explicação `exempt service; not evaluated`.
 
 **Avaliador `pii_detection`**
 
@@ -291,7 +296,18 @@ Entram por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-v
 | `system_prompt_leak` | 20 ou mais palavras copiadas em sequência das instruções de sistema, ou cobertura dos 8-gramas das instruções acima de 0,15. Limiares iniciais, a calibrar. Só se aplica com instruções de 30 palavras ou mais | `1 - cobertura` |
 | `output_format` | alguma saída não é JSON válido, com `gen_ai.output.type` = `json`. Só sintaxe: a semconv de referência não tem atributo com o schema pedido | fração de saídas válidas |
 
-O resultado segue o do `pii_detection`: `score` 0.0 e `label` `fail` com ao menos uma ocorrência; `score` 1.0 e `label` `pass` sem nenhuma. A explicação traz só tipos, contagens e onde apareceram, por exemplo `aws_access_key=1 (input)`, e nunca prefixo ou sufixo da credencial. Os padrões com prefixo conhecido têm prioridade; a entropia só decide no token genérico.
+**Avaliador `relevance` (0.3.0)**
+
+LLM-as-a-Judge, por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-v0-3-plan.md](plans/eval-v0-3-plan.md); o `faithfulness` do mesmo plano ficou para uma versão futura. O resumo:
+
+- **Pergunta.** A resposta atende ao que o usuário pediu? O juiz lê as mensagens de usuário novas no turno, as partes `text` da saída e até 4 mensagens de texto anteriores ao turno (`context_messages`, 1.000 caracteres cada). Aplica-se quando há mensagem de usuário no turno e texto na saída.
+- **Escala.** Nota de 1 a 5 com justificativa. Score `(nota - 1) / 4`; `pass` com nota 3 ou mais (limiar inicial, a calibrar). `sample_rate` 0.05, `max_chars` 16.000, `timeout_s` 30.
+- **Cliente.** SDK `openai` sobre a API Chat Completions, na API da OpenAI ou num servidor compatível (`LLM_EVAL_JUDGE_BASE_URL`: vLLM, Ollama, LiteLLM). Saída estruturada por JSON schema em modo strict, com `json_object` e `none` para servidores que não aceitam; a resposta é validada contra o schema em todos os modos. `LLM_EVAL_JUDGE_MODEL` é obrigatório, sem padrão.
+- **Faixa de execução.** Fila própria (`LLM_EVAL_JUDGE_QUEUE_MAX`) e chamadas simultâneas limitadas (`LLM_EVAL_JUDGE_MAX_CONCURRENCY`). Faixa cheia, orçamento de tokens esgotado (`LLM_EVAL_JUDGE_TOKENS_PER_MINUTE`) e desligamento descartam a avaliação e contam em `llm_eval.evaluations.dropped`, sem 429: a fila principal é que faz a contrapressão.
+- **Privacidade.** Antes do envio, o que `find_pii` e `find_secrets` detectam vira o tipo (`[CPF]`, `[EMAIL]`, `[SECRET]`). Nomes e endereços passam. O conteúdo vai em JSON dentro de `<conversation>…</conversation>`, com `<` escapado, e o prompt diz que tudo ali é dado, nunca instrução.
+- **Erros.** `judge_refusal` (recusa ou filtro do provedor), `judge_truncated` (`finish_reason=length`), `judge_invalid_output` (fora do schema), `timeout` e o nome da classe da exceção do SDK.
+
+O resultado das heurísticas segue o do `pii_detection`: `score` 0.0 e `label` `fail` com ao menos uma ocorrência; `score` 1.0 e `label` `pass` sem nenhuma. A explicação traz só tipos, contagens e onde apareceram, por exemplo `aws_access_key=1 (input)`, e nunca prefixo ou sufixo da credencial. Os padrões com prefixo conhecido têm prioridade; a entropia só decide no token genérico.
 
 **Estrutura do repositório**
 
@@ -302,11 +318,15 @@ src/llm_eval_otel/
   semconv.py           # constantes de nomes de atributo, evento e métrica
   ingest/http.py       # POST /v1/traces, /healthz e /readyz
   extract/genai.py     # span -> GenAIInteraction (dois formatos)
-  engine/queue.py  engine/runner.py
+  engine/queue.py  engine/runner.py  engine/lanes.py
   evaluators/base.py  evaluators/pii.py  evaluators/secrets.py
-  evaluators/registry.py
+  evaluators/refusal.py  evaluators/prompt_leak.py  evaluators/output_format.py
+  evaluators/relevance.py  evaluators/registry.py
+  judge/client.py  judge/openai_adapter.py  judge/evaluator.py  judge/redact.py  judge/schema.py
   emit/sdk.py  emit/emitter.py  emit/sanitize.py
 tools/span_generator.py  # spans sintéticos para a demonstração
+tools/fake_judge_server.py  # juiz falso compatível com OpenAI, para testes e demonstração
+tools/benchmark.py       # calibração: um avaliador contra um conjunto rotulado
 deploy/otel-collector-config.yaml
 deploy/docker-compose.yaml
 tests/unit/  tests/e2e/
@@ -364,7 +384,7 @@ Um evento por avaliador por span, emitido como log record pela API de Logs do SD
 | `gen_ai.operation.name` | `chat` | semconv, copiado do span avaliado |
 | `gen_ai.provider.name` | `openai` | semconv, copiado do span avaliado |
 | `gen_ai.request.model` | `gpt-4o-mini` | semconv, copiado do span avaliado |
-| `error.type` | `timeout` | semconv, só quando o avaliador falha |
+| `error.type` | `timeout` | semconv, só quando o avaliador falha; nos juízes também `judge_refusal`, `judge_truncated`, `judge_invalid_output` ou o nome da classe da exceção do SDK |
 | `llm_eval.source.service.name` | `bank-chatbot` | próprio: `service.name` da aplicação que gerou o span |
 | `traceloop.association.properties.*` | `scenario=pix` | OpenLLMetry: copiados do span avaliado, com o mesmo nome |
 | `llm_eval.evaluation.type` | `heuristic` | próprio |
@@ -376,6 +396,8 @@ Um evento por avaliador por span, emitido como log record pela API de Logs do SD
 | `llm_eval.prompt_leak.longest_run` | `37` | próprio, só no `system_prompt_leak`: maior sequência de palavras copiadas |
 | `llm_eval.output_format.error` | `syntax`, `empty` ou `truncated` | próprio, só no `output_format` com `fail` |
 | `llm_eval.content.truncated` | `true` | próprio, só quando o avaliador tem `max_chars` e o texto passou dele |
+| `llm_eval.judge.model` | `gpt-5-mini-2025-08-07` | próprio, só no `relevance`: o modelo que respondeu |
+| `llm_eval.judge.raw_score` | `4` | próprio, só no `relevance`: a nota do juiz, de 1 a 5 |
 
 A severidade do log record segue o resultado: `INFO` para `pass` e `exempt`, `WARN` para `fail` e `ERROR` quando o avaliador falha. Isso permite filtrar falhas em backends de log sem ler atributos.
 
@@ -396,12 +418,18 @@ No `opentelemetry-sdk` 1.45.0 a API de Logs ainda fica em `opentelemetry._logs` 
 
 Ligado por padrão (`LLM_EVAL_EMIT_SPANS=true`). Kind `INTERNAL`, pai = contexto remoto do span avaliado, duração = tempo da avaliação, mesmos atributos do evento e status `ERROR` quando há `error.type`. Existe porque backends de trace como Jaeger e Tempo mostram o span dentro do trace, mas nem sempre mostram log records ligados a ele. Não é definido pela semconv.
 
+Nos juízes, cada chamada ao juiz vira um span `chat {gen_ai.request.model}`, kind `CLIENT`, filho do span `evaluate`, com os atributos de chamada de cliente da semconv: `gen_ai.operation.name`, `gen_ai.provider.name` (`openai`, a API usada), `gen_ai.request.model`, `gen_ai.response.model`, `server.address`, `server.port`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.response.finish_reasons` e `error.type`. Nunca `gen_ai.input.messages` nem `gen_ai.output.messages`, o que copiaria o conteúdo do usuário para o backend. Os spans são montados pelo emissor a partir de um registro de cada chamada feito pelo adaptador; nenhuma biblioteca de instrumentação automática envolve o SDK. Com `LLM_EVAL_EMIT_SPANS=false`, não sai nenhum dos dois spans.
+
 ### Saída 3: métricas
 
 | Métrica | Instrumento | Unidade | Atributos |
 | --- | --- | --- | --- |
-| `llm_eval.evaluations` | Counter | `{evaluation}` | `gen_ai.evaluation.name`, `gen_ai.evaluation.score.label`, `error.type` (só em falha), `llm_eval.source.service.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `traceloop.association.properties.*` |
-| `llm_eval.evaluation.score` | Histogram, limites 0.1, 0.2 … 1.0 | `1` | `gen_ai.evaluation.name`, `llm_eval.source.service.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `traceloop.association.properties.*`; não recebe `exempt` nem erro |
+| `llm_eval.evaluations` | Counter | `{evaluation}` | `gen_ai.evaluation.name`, `llm_eval.evaluation.type`, `gen_ai.evaluation.score.label`, `error.type` (só em falha), `llm_eval.source.service.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `traceloop.association.properties.*` |
+| `llm_eval.evaluation.score` | Histogram, limites 0.1, 0.2 … 1.0 | `1` | `gen_ai.evaluation.name`, `llm_eval.evaluation.type`, `llm_eval.source.service.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `traceloop.association.properties.*`; não recebe `exempt` nem erro |
+| `gen_ai.client.token.usage` | Histogram, limites da semconv | `{token}` | métrica da semconv para as chamadas do juiz: `gen_ai.token.type`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `server.address`, `server.port`, `gen_ai.evaluation.name` |
+| `gen_ai.client.operation.duration` | Histogram, limites da semconv | `s` | os mesmos, sem o tipo de token, e `error.type` em falha |
+
+O serviço não calcula custo em dinheiro, porque preço muda: o painel multiplica tokens pelo preço vigente.
 
 Nenhum atributo de métrica recebe TraceID, SpanID, `gen_ai.response.id` ou texto livre, para manter a cardinalidade baixa. `llm_eval.source.service.name` cresce com o número de aplicações, não com o tráfego. As association properties seguem para as métricas com os mesmos nomes das métricas OpenLLMetry da aplicação, exceto as chaves de `LLM_EVAL_ASSOCIATION_EXCLUDE` (padrão `correlation_id`), cujo valor muda a cada requisição. O evento e o span recebem todas.
 
@@ -410,8 +438,10 @@ Nenhum atributo de métrica recebe TraceID, SpanID, `gen_ai.response.id` ou text
 Nenhum valor sensível bruto sai do serviço, em nenhum sinal. Três camadas garantem isso:
 
 1. O `pii_detection` e o `secret_detection` montam a explicação só com tipos, contagens e localização (`system`, `input`, `output`), por template.
-2. `emit/sanitize.py` repassa os detectores de PII e de credenciais em todo atributo string antes de chamar o SDK. Se casar, o valor vira `[REDACTED]` e `llm_eval.sanitizer.redactions` incrementa. Isso cobre avaliadores de terceiros, como um LLM-as-a-judge que cite o texto na explicação.
+2. `emit/sanitize.py` repassa os detectores de PII e de credenciais em todo atributo string antes de chamar o SDK. Se casar, o valor vira `[REDACTED]` e `llm_eval.sanitizer.redactions` incrementa. Isso cobre avaliadores de terceiros, como um LLM-as-a-Judge que cite o texto na explicação.
 3. Logs do próprio serviço nunca incluem conteúdo de mensagem, e `error.type` usa o nome da classe da exceção, nunca a mensagem dela.
+
+Os juízes são a exceção declarada a duas dessas regras. O conteúdo sai do serviço para o provedor do juiz, mascarado antes do envio (`LLM_EVAL_JUDGE_REDACT`, ligado por padrão), e a explicação é texto livre do juiz: o prompt pede para não citar o conteúdo, o serviço corta em 300 caracteres e o sanitizador passa por ela. Um nome citado passa pelo sanitizador; `LLM_EVAL_JUDGE_EXPLANATION=false` troca a explicação por `score=4/5`.
 
 ## Requisitos não funcionais
 
@@ -427,7 +457,7 @@ O serviço é stateless, confirma o recebimento assim que a interação entra na
 
 - Resposta 200 após enfileirar, não após avaliar. Payload inválido devolve 400, sem retry, e conta em `llm_eval.spans.skipped` com o motivo `invalid_payload`. Fila cheia devolve 429 com `Retry-After`, que o exportador do Collector trata como reenviável.
 - A fila fica em memória: um crash perde o que estava nela. Isso é aceito: a avaliação é complementar, e o span original segue intacto para o backend.
-- SIGTERM para de aceitar dados, drena a fila por até 30 s e chama `force_flush` nos providers do SDK.
+- SIGTERM para de aceitar dados, drena a fila principal e depois a faixa dos juízes, as duas dentro dos mesmos 30 s, e chama `force_flush` nos providers do SDK. O que sobra na faixa conta em `llm_eval.evaluations.dropped` com o motivo `shutdown`.
 - Deduplicação por (TraceID, SpanID) com TTL de 10 min evita avaliar duas vezes o mesmo span reenviado.
 - Escala horizontal por réplicas. A deduplicação é por instância; para evitá-la entre réplicas, o Collector usa o exportador `loadbalancing` com `routing_key: traceID`.
 
@@ -442,11 +472,15 @@ O serviço é stateless, confirma o recebimento assim que a interação entra na
 | Sinal | Tipo | Atributos |
 | --- | --- | --- |
 | `llm_eval.spans.received` | Counter | nenhum |
-| `llm_eval.spans.skipped` | Counter | `llm_eval.skip.reason` (`not_inference`, `no_content`, `duplicate`, `invalid_payload`) |
+| `llm_eval.spans.skipped` | Counter | `llm_eval.skip.reason` (`not_inference`, `no_content`, `duplicate`, `invalid_payload`, `self_telemetry`) |
 | `llm_eval.queue.size` | UpDownCounter | nenhum |
 | `llm_eval.evaluation.duration` | Histogram, `s` | `gen_ai.evaluation.name`, `error.type` |
 | `llm_eval.sanitizer.redactions` | Counter | `gen_ai.evaluation.name` |
-| `GET /healthz` e `GET /readyz` | HTTP | `/readyz` falha com a fila acima de 90% |
+| `llm_eval.evaluations.dropped` | Counter | `gen_ai.evaluation.name`, `llm_eval.drop.reason` (`lane_full`, `budget`, `shutdown`) |
+| `llm_eval.lane.size` | UpDownCounter | `llm_eval.lane` (`llm_judge`) |
+| `GET /healthz` e `GET /readyz` | HTTP | `/readyz` falha com a fila principal acima de 90%; a faixa dos juízes não conta |
+
+`self_telemetry` conta spans cujo `service.name` do resource é o do próprio serviço: a saída do avaliador devolvida a ele por engano de configuração do Collector. Eles nunca são avaliados.
 
 **Configuração**
 
@@ -471,6 +505,19 @@ As variáveis `OTEL_*` são as padrão do SDK; as `LLM_EVAL_*` são do serviço.
 | `LLM_EVAL_DEDUP_TTL_S` | `600` | janela de deduplicação |
 | `LLM_EVAL_AUTH_TOKEN` | vazio | exige `Authorization: Bearer` quando definido |
 | `LLM_EVAL_TLS_CERT_FILE` e `LLM_EVAL_TLS_KEY_FILE` | vazio | ligam TLS no uvicorn quando os dois estão definidos |
+| `LLM_EVAL_JUDGE_MODEL` | vazio, obrigatório com juiz habilitado | ID do modelo do juiz |
+| `LLM_EVAL_JUDGE_BASE_URL` | vazio (API da OpenAI) | endpoint compatível com OpenAI, como vLLM, Ollama ou LiteLLM |
+| `LLM_EVAL_JUDGE_RESPONSE_FORMAT` | `json_schema` | `json_schema`, `json_object` ou `none`, conforme o que o servidor aceita |
+| `LLM_EVAL_JUDGE_TEMPERATURE` | vazio (não enviado) | `temperature` da chamada |
+| `LLM_EVAL_JUDGE_REASONING_EFFORT` | vazio (não enviado) | `reasoning_effort`, para modelos de raciocínio |
+| `LLM_EVAL_JUDGE_MAX_OUTPUT_TOKENS` | `1024` | `max_completion_tokens` da chamada, raciocínio incluído; também entra na estimativa do orçamento |
+| `LLM_EVAL_JUDGE_MAX_CONCURRENCY` | `8` | chamadas simultâneas ao juiz |
+| `LLM_EVAL_JUDGE_QUEUE_MAX` | `1000` | avaliações na faixa antes de descartar |
+| `LLM_EVAL_JUDGE_TOKENS_PER_MINUTE` | vazio (sem limite) | orçamento de tokens |
+| `LLM_EVAL_JUDGE_REDACT` | `true` | mascara PII e credenciais antes de enviar |
+| `LLM_EVAL_JUDGE_EXPLANATION` | `true` | emite a justificativa do juiz como explicação |
+
+A credencial do juiz é a variável padrão do SDK, `OPENAI_API_KEY`.
 
 ## Plano de implementação
 
@@ -546,7 +593,7 @@ async def test_pii_in_prompt_is_flagged_without_leaking(app, otel_memory):
 
 ## Roadmap de avaliadores
 
-Depois da v0.1, os avaliadores entram em três ondas, da mais barata para a mais cara: heurísticas locais ([v0.2](plans/eval-v0-2-plan.md)), classificadores locais ([v0.3](plans/eval-v0-3-plan.md)) e LLM-as-a-judge ([v0.4](plans/eval-v0-4-plan.md)). Cada onda exige um pouco mais da arquitetura. Os modelos citados são candidatos, a validar em português antes de entrar.
+Depois da v0.1, os avaliadores entram em três ondas: heurísticas locais ([v0.2](plans/eval-v0-2-plan.md)), LLM-as-a-Judge ([v0.3](plans/eval-v0-3-plan.md)) e classificadores locais ([v0.4](plans/eval-v0-4-plan.md)). Cada onda exige um pouco mais da arquitetura. Os modelos citados são candidatos, a validar em português antes de entrar.
 
 | Versão | Avaliador | Como | O que muda na arquitetura |
 | --- | --- | --- | --- |
@@ -554,16 +601,16 @@ Depois da v0.1, os avaliadores entram em três ondas, da mais barata para a mais
 | v0.2 (entregue) | `system_prompt_leak` | sobreposição de 8-gramas entre a resposta e `gen_ai.system_instructions` | três campos no modelo de dados; depende de as aplicações gravarem as instruções de sistema |
 | v0.2 (entregue) | `output_format` | valida a sintaxe do JSON se `gen_ai.output.type` = `json`; o schema fica para quando houver atributo com ele | idem |
 | v0.2 (entregue) | `refusal` | frases de recusa do modelo em português, inglês e espanhol, e `finish_reason=content_filter` | idem |
-| v0.3 | `prompt_injection` | classificador local pequeno; candidato: Llama Prompt Guard 2 (multilíngue) | workers dedicados ao modelo |
-| v0.3 | `toxicity` | classificador local; candidato: Detoxify multilíngue, que cobre português | idem |
-| v0.3 | PII por reconhecimento de entidades: nomes, endereços | Presidio com modelo spaCy em português | idem |
-| v0.4 | `relevance` | LLM-as-a-judge: a resposta atende à pergunta? | custo por token; `sample_rate` abaixo de 1.0; sanitizador aplicado à explicação do juiz |
-| v0.4 | `faithfulness` | LLM-as-a-judge compara a resposta com os documentos recuperados | agrupar spans do mesmo trace, porque `gen_ai.retrieval.documents` fica no span de retrieval; `sample_rate` abaixo de 1.0 |
+| v0.3 (entregue em 0.3.0, sem calibração) | `relevance` | LLM-as-a-Judge: a resposta atende à pergunta? Juiz pelo SDK da OpenAI, na API da OpenAI ou num servidor compatível (vLLM, Ollama) | faixa de execução com fila própria; custo por token; `sample_rate` abaixo de 1.0; mascaramento antes do envio; sanitizador aplicado à explicação do juiz |
+| v0.3 (adiado) | `faithfulness` | LLM-as-a-Judge compara a resposta com os documentos recuperados | agrupar spans do mesmo trace, porque `gen_ai.retrieval.documents` fica no span de retrieval; `sample_rate` abaixo de 1.0 |
+| v0.4 | `prompt_injection` | classificador local pequeno; candidato: Llama Prompt Guard 2 (multilíngue) | faixa com workers dedicados ao modelo |
+| v0.4 | `toxicity` | classificador local; candidato: Detoxify multilíngue, que cobre português | idem |
+| v0.4 | PII por reconhecimento de entidades: nomes, endereços | Presidio com modelo spaCy em português | idem |
 
-- Jailbreak por regex fica fora de propósito: frases como “ignore previous instructions” deixam passar variações e geram alarme falso. Ele entra na v0.3, com classificador.
+- Jailbreak por regex fica fora de propósito: frases como “ignore previous instructions” deixam passar variações e geram alarme falso. Ele entra na v0.4, com classificador.
 - A interface da v0.1 já comporta a v0.3 e a v0.4: `kind`, `timeout_s`, `sample_rate` e `max_chars` cobrem modelos locais e juízes amostrados, sem mudar as heurísticas, que seguem em 100%.
 - `faithfulness` é a maior mudança: hoje cada span é avaliado sozinho, e esse avaliador precisa esperar o trace completo, com um buffer por TraceID e janela de tempo.
-- As chamadas do juiz geram spans GenAI próprios. Eles precisam ser marcados para não voltarem ao avaliador, o mesmo risco de loop descrito em Riscos.
+- As chamadas do juiz geram spans GenAI próprios, sem conteúdo. A topologia já impede que voltem ao avaliador; como defesa extra, o extrator descarta spans com o `service.name` do próprio serviço (`self_telemetry`).
 
 ## Pré-requisitos para adotar
 
@@ -583,4 +630,5 @@ O serviço só avalia o que chega até ele. Três condições do lado de quem ad
 | Falso positivo de credencial genérica: hashes, UUIDs e base64 também têm alta entropia | Alertas indevidos | Entropia só no token genérico e só com nome de campo por perto; padrões com prefixo têm prioridade; limiar calibrado com os casos de teste |
 | Serviço liberado por engano em `LLM_EVAL_EXCEPTIONS` | Um vazamento real vira `exempt` e não gera alerta | Lista versionada e revisada como código; painel com o volume de `exempt` por serviço; o evento continua registrando o que foi encontrado |
 | O PII continua no span original, que segue para o backend | Dado sensível armazenado no backend de traces | Fora do escopo; um processador `transform` no pipeline do backend pode mascarar, em trabalho separado |
-| Loop de telemetria: as saídas do avaliador voltam para ele | Carga dobrada e avaliação de spans de avaliação | Receptor dedicado no Collector (porta 4319) cujo pipeline não exporta para o avaliador |
+| Loop de telemetria: as saídas do avaliador voltam para ele | Carga dobrada e avaliação de spans de avaliação | Receptor dedicado no Collector (porta 4319) cujo pipeline não exporta para o avaliador; spans do próprio serviço descartados como `self_telemetry` |
+| Conteúdo enviado ao provedor do juiz | Exposição fora do perímetro | Juiz só por opção e numa amostra; mascaramento de PII e credenciais por padrão; juiz local por `LLM_EVAL_JUDGE_BASE_URL`; nomes e endereços não são mascarados, o que está documentado no README |

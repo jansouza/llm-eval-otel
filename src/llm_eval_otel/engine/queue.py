@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
 
-from llm_eval_otel.engine.runner import EvaluationRecord, Runner
+from llm_eval_otel.engine.runner import EvaluationRecord, Runner, ref
 from llm_eval_otel.evaluators.base import GenAIInteraction
 
 log = logging.getLogger(__name__)
@@ -114,13 +114,24 @@ class EvaluationQueue:
         while True:
             interaction = await self._queue.get()
             self._on_size_change(-1)
+            start = time.perf_counter()
             try:
                 records = await self.runner.run(interaction)
                 outcome = self.sink(records)
                 if outcome is not None:
                     await outcome
+                log.debug(
+                    "interaction %s operation=%s model=%s: %d results in %.1f ms",
+                    ref(interaction),
+                    interaction.operation_name,
+                    interaction.request_model,
+                    len(records),
+                    (time.perf_counter() - start) * 1000,
+                )
             except Exception as exc:
-                log.error("failed to process an interaction: %s", type(exc).__name__)
+                log.error(
+                    "failed to process interaction %s: %s", ref(interaction), type(exc).__name__
+                )
             finally:
                 self._queue.task_done()
 

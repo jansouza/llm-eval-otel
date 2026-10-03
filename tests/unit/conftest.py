@@ -123,7 +123,7 @@ async def make_service(
 
     yield factory
     for service in started:
-        await service.queue.stop()
+        await service.stop_workers()
 
 
 @pytest.fixture

@@ -102,8 +102,15 @@ def test_metrics(otel_memory: OtelMemory) -> None:
     assert count("llm_eval.evaluations", {"gen_ai.evaluation.score.label": "exempt"}) == 1
     assert count("llm_eval.evaluations", {"error.type": "timeout"}) == 1
     assert count("llm_eval.evaluations", {"llm_eval.source.service.name": "support-bot"}) == 4
+    assert count("llm_eval.evaluations", {"llm_eval.evaluation.type": "heuristic"}) == 4
     # Neither exempt nor error reach the score histogram.
     assert otel_memory.histogram_count("llm_eval.evaluation.score") == 2
+    assert (
+        otel_memory.histogram_count(
+            "llm_eval.evaluation.score", {"llm_eval.evaluation.type": "heuristic"}
+        )
+        == 2
+    )
     assert otel_memory.histogram_count("llm_eval.evaluation.duration") == 4
 
     otel_memory.serialize_all()

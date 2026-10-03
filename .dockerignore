@@ -1,0 +1,12 @@
+.venv
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+deploy/e2e-output
+docs
+tests
+tools
+scripts

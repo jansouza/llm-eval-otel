@@ -1,0 +1,74 @@
+# Demo: synthetic app -> Collector -> llm-eval-otel -> Collector -> Grafana LGTM.
+#   docker compose -f deploy/docker-compose.yaml up --build
+# Grafana: http://localhost:3000 (Tempo for traces, Loki for events, Prometheus for metrics)
+# The relevance judge is a deterministic fake (tools/fake_judge_server.py): no API key.
+name: llm-eval-otel
+
+services:
+  backend:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000"
+
+  # Docker creates a missing bind-mount directory as root with mode 755, and the Collector
+  # (uid 10001) would fail to open its file exporter there and exit.
+  output-dir:
+    image: ${LLM_EVAL_IMAGE:-llm-eval-otel:dev}
+    user: "0"
+    entrypoint: ["chmod", "0777", "/data"]
+    volumes:
+      - ${E2E_OUTPUT_DIR:-./e2e-output}:/data
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+      - ${E2E_OUTPUT_DIR:-./e2e-output}:/data
+    depends_on:
+      backend: { condition: service_started }
+      output-dir: { condition: service_completed_successfully }
+
+  llm-eval-otel:
+    build: { context: .., dockerfile: Dockerfile }
+    image: ${LLM_EVAL_IMAGE:-llm-eval-otel:dev}
+    read_only: true
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4319
+      OTEL_METRIC_EXPORT_INTERVAL: "5000"
+      LLM_EVAL_EVALUATORS: pii_detection,secret_detection,refusal,system_prompt_leak,output_format,relevance
+      LLM_EVAL_EXCEPTIONS: '{"bank-chatbot": ["pii_detection", "relevance"]}'
+      # The demo judges every span; in production relevance samples 5% of traces.
+      LLM_EVAL_SAMPLE_RATES: relevance=1.0
+      # To use the OpenAI API instead, drop the base URL and set a real model and key, e.g.
+      # LLM_EVAL_JUDGE_MODEL: gpt-5-mini-2025-08-07 and OPENAI_API_KEY from a secret.
+      LLM_EVAL_JUDGE_MODEL: fake-judge-1
+      LLM_EVAL_JUDGE_BASE_URL: http://fake-judge:8080/v1
+      OPENAI_API_KEY: unused-by-the-fake-judge
+    depends_on:
+      otel-collector: { condition: service_started }
+      fake-judge: { condition: service_healthy }
+
+  fake-judge:
+    image: ${LLM_EVAL_IMAGE:-llm-eval-otel:dev}
+    entrypoint: ["python", "/tools/fake_judge_server.py"]
+    # The e2e test reads what the judge received, to check that nothing sensitive got there.
+    command: ["--port", "8080", "--record", "/data/judge-requests.jsonl"]
+    volumes:
+      - ../tools:/tools:ro
+      - ${E2E_OUTPUT_DIR:-./e2e-output}:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  span-generator:
+    image: ${LLM_EVAL_IMAGE:-llm-eval-otel:dev}
+    entrypoint: ["python", "/tools/span_generator.py"]
+    command: ["--endpoint", "http://otel-collector:4318/v1/traces", "--every", "${GENERATOR_EVERY:-30}"]
+    healthcheck: { disable: true }  # the image's healthcheck is the service's /healthz
+    volumes:
+      - ../tools:/tools:ro
+    depends_on:
+      llm-eval-otel: { condition: service_healthy }

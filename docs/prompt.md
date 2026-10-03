@@ -11,7 +11,7 @@ REQUISITOS ARQUITETURAIS:
 2. Mecanismo de Avaliação (Evaluator Engine):
    - Extrair o conteúdo relevante do span (ex: gen_ai.prompt, gen_ai.completion, input/output do span de chat/LLM).
    - Implementar uma avaliação interna heurística/segurança (exemplo concreto: Detecção de PII com scanner local de regex para CPF, E-mail e Cartão de Crédito).
-   - Deixar a interface extensível para plugar outros avaliadores (ex: toxicidade, jailbreak ou LLM-as-a-judge).
+   - Deixar a interface extensível para plugar outros avaliadores (ex: toxicidade, jailbreak ou LLM-as-a-Judge).
 
 3. Compatibilidade com OTel SemConv GenAI:
    - Para cada avaliação executada, enriquecer a telemetria gerando:

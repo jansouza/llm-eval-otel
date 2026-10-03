@@ -5,4 +5,4 @@ everything the service emits, identifying the detection rules. Bump the minor ve
 whenever what gets detected changes.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.2"

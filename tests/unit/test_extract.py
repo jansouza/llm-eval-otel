@@ -325,3 +325,62 @@ def test_openllmetry_finish_reasons() -> None:
     i = only(make_request(make_span(attrs)))
     assert i.finish_reasons == ("stop", "content_filter")
     assert [m.text for m in i.output_messages] == ["a"]
+
+
+def test_context_is_the_last_text_messages_before_the_turn() -> None:
+    i = only(make_request(make_span(semconv_attrs(three_turns(), [text("assistant", "x")]))))
+    assert i.input_messages == [Message("user", "Obrigado")]
+    assert i.context_messages == [
+        Message("user", f"Meu CPF é {CPF}"),
+        Message("assistant", "Anotado."),
+        Message("user", "E meu saldo?"),
+        Message("assistant", "R$ 10."),
+    ]
+
+
+def test_context_keeps_at_most_four_text_messages_each_capped() -> None:
+    long = "a" * 5000
+    history = [text("user", "first"), *three_turns()[:-1], text("assistant", long)]
+    msgs = [text("system", "regras"), *history, text("user", "e agora?")]
+    i = only(make_request(make_span(semconv_attrs(msgs))))
+    assert [m.text for m in i.context_messages] == [
+        "Anotado.",
+        "E meu saldo?",
+        "R$ 10.",
+        "a" * 1000,
+    ]
+    assert all(m.role != "system" for m in i.context_messages)
+
+
+def test_context_leaves_out_tool_calls_and_results() -> None:
+    msgs = [
+        text("user", "consulte o pedido"),
+        {
+            "role": "assistant",
+            "parts": [
+                {"type": "text", "content": "Vou consultar."},
+                {"type": "tool_call", "name": "db", "arguments": {"id": 1}},
+            ],
+        },
+        {"role": "tool", "parts": [{"type": "tool_call_response", "response": "ok"}]},
+        {"role": "assistant", "parts": [{"type": "tool_call", "name": "db", "arguments": {}}]},
+        text("user", "e então?"),
+    ]
+    i = only(make_request(make_span(semconv_attrs(msgs))))
+    assert i.context_messages == [
+        Message("user", "consulte o pedido"),
+        Message("assistant", "Vou consultar."),
+    ]
+
+
+def test_first_turn_has_no_context() -> None:
+    assert only(make_request(make_span(semconv_attrs([text("user", "oi")])))).context_messages == []
+
+
+def test_spans_from_the_service_itself_are_skipped() -> None:
+    span = make_span(semconv_attrs([text("user", "oi")]))
+    own = make_request(span, service_name="llm-eval-otel")
+    assert extract(own, "llm-eval-otel").skipped == {"self_telemetry": 1}
+    assert len(extract(own).interactions) == 1  # only when the own name is known
+    other = make_request(span, service_name="support-bot")
+    assert len(extract(other, "llm-eval-otel").interactions) == 1

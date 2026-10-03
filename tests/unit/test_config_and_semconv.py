@@ -15,6 +15,43 @@ def test_defaults() -> None:
     assert s.association_exclude == ["correlation_id"]
     assert s.pii_types == ["cpf", "cnpj", "email", "credit_card", "phone", "pix_key"]
     assert not s.tls_enabled
+    assert s.judge_model is None and s.judge_base_url is None
+    assert s.judge_response_format == "json_schema"
+    assert s.judge_temperature is None and s.judge_reasoning_effort is None
+    assert (s.judge_max_concurrency, s.judge_queue_max) == (8, 1000)
+    assert s.judge_tokens_per_minute is None
+    assert s.judge_redact is True and s.judge_explanation is True
+    assert s.log_level == "INFO"
+
+
+def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_EVAL_LOG_LEVEL", "debug")
+    assert Settings().log_level == "DEBUG"
+    monkeypatch.setenv("LLM_EVAL_LOG_LEVEL", "verbose")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_parses_judge_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_EVAL_JUDGE_MODEL", "gpt-5-mini-2025-08-07")
+    monkeypatch.setenv("LLM_EVAL_JUDGE_BASE_URL", "http://vllm:8000/v1")
+    monkeypatch.setenv("LLM_EVAL_JUDGE_RESPONSE_FORMAT", "json_object")
+    monkeypatch.setenv("LLM_EVAL_JUDGE_TEMPERATURE", "0")
+    monkeypatch.setenv("LLM_EVAL_JUDGE_TOKENS_PER_MINUTE", "200000")
+    monkeypatch.setenv("LLM_EVAL_JUDGE_REDACT", "false")
+    s = Settings()
+    assert s.judge_model == "gpt-5-mini-2025-08-07"
+    assert s.judge_base_url == "http://vllm:8000/v1"
+    assert s.judge_response_format == "json_object"
+    assert s.judge_temperature == 0.0
+    assert s.judge_tokens_per_minute == 200_000
+    assert s.judge_redact is False
+
+
+def test_rejects_unknown_response_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_EVAL_JUDGE_RESPONSE_FORMAT", "xml")
+    with pytest.raises(ValueError, match="judge_response_format"):
+        Settings()
 
 
 def test_parses_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,6 +124,8 @@ def test_semconv_names_snapshot() -> None:
         "PART_TOOL_CALL": "tool_call",
         "PART_TOOL_CALL_RESPONSE": "tool_call_response",
         "SERVICE_NAME": "service.name",
+        "ROLE_USER": "user",
+        "ROLE_ASSISTANT": "assistant",
         "EVENT_EVALUATION_RESULT": "gen_ai.evaluation.result",
         "SPAN_NAME_PREFIX": "evaluate",
         "GEN_AI_EVALUATION_NAME": "gen_ai.evaluation.name",
@@ -94,6 +133,7 @@ def test_semconv_names_snapshot() -> None:
         "GEN_AI_EVALUATION_SCORE_LABEL": "gen_ai.evaluation.score.label",
         "GEN_AI_EVALUATION_EXPLANATION": "gen_ai.evaluation.explanation",
         "ERROR_TYPE": "error.type",
+        "ERROR_TIMEOUT": "timeout",
         "LLM_EVAL_SOURCE_SERVICE_NAME": "llm_eval.source.service.name",
         "LLM_EVAL_EVALUATION_TYPE": "llm_eval.evaluation.type",
         "LLM_EVAL_PII_TYPES": "llm_eval.pii.types",
@@ -104,7 +144,11 @@ def test_semconv_names_snapshot() -> None:
         "LLM_EVAL_PROMPT_LEAK_LONGEST_RUN": "llm_eval.prompt_leak.longest_run",
         "LLM_EVAL_OUTPUT_FORMAT_ERROR": "llm_eval.output_format.error",
         "LLM_EVAL_CONTENT_TRUNCATED": "llm_eval.content.truncated",
+        "LLM_EVAL_JUDGE_MODEL": "llm_eval.judge.model",
+        "LLM_EVAL_JUDGE_RAW_SCORE": "llm_eval.judge.raw_score",
         "LLM_EVAL_SKIP_REASON": "llm_eval.skip.reason",
+        "LLM_EVAL_DROP_REASON": "llm_eval.drop.reason",
+        "LLM_EVAL_LANE": "llm_eval.lane",
         "LLM_EVAL_ATTRIBUTE_PREFIX": "llm_eval.",
         "LABEL_PASS": "pass",
         "LABEL_FAIL": "fail",
@@ -116,8 +160,27 @@ def test_semconv_names_snapshot() -> None:
         "METRIC_SPANS_SKIPPED": "llm_eval.spans.skipped",
         "METRIC_QUEUE_SIZE": "llm_eval.queue.size",
         "METRIC_SANITIZER_REDACTIONS": "llm_eval.sanitizer.redactions",
+        "METRIC_EVALUATIONS_DROPPED": "llm_eval.evaluations.dropped",
+        "METRIC_LANE_SIZE": "llm_eval.lane.size",
         "SKIP_NOT_INFERENCE": "not_inference",
         "SKIP_NO_CONTENT": "no_content",
         "SKIP_DUPLICATE": "duplicate",
         "SKIP_INVALID_PAYLOAD": "invalid_payload",
+        "SKIP_SELF_TELEMETRY": "self_telemetry",
+        "DROP_LANE_FULL": "lane_full",
+        "DROP_BUDGET": "budget",
+        "DROP_SHUTDOWN": "shutdown",
+        "OPERATION_CHAT": "chat",
+        "PROVIDER_OPENAI": "openai",
+        "GEN_AI_RESPONSE_MODEL": "gen_ai.response.model",
+        "GEN_AI_USAGE_INPUT_TOKENS": "gen_ai.usage.input_tokens",
+        "GEN_AI_USAGE_OUTPUT_TOKENS": "gen_ai.usage.output_tokens",
+        "GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS": "gen_ai.usage.cache_read.input_tokens",
+        "GEN_AI_TOKEN_TYPE": "gen_ai.token.type",
+        "TOKEN_TYPE_INPUT": "input",
+        "TOKEN_TYPE_OUTPUT": "output",
+        "SERVER_ADDRESS": "server.address",
+        "SERVER_PORT": "server.port",
+        "METRIC_CLIENT_TOKEN_USAGE": "gen_ai.client.token.usage",
+        "METRIC_CLIENT_OPERATION_DURATION": "gen_ai.client.operation.duration",
     }

@@ -1,6 +1,10 @@
 import asyncio
+import dataclasses
+import logging
 import random
 from dataclasses import dataclass
+
+import pytest
 
 from llm_eval_otel.engine.runner import Runner, sampled, truncate
 from llm_eval_otel.evaluators.base import (
@@ -8,6 +12,7 @@ from llm_eval_otel.evaluators.base import (
     EvaluatorKind,
     GenAIInteraction,
     Message,
+    PartSpan,
 )
 from llm_eval_otel.evaluators.pii import PIIDetector
 from llm_eval_otel.evaluators.secrets import SecretDetector
@@ -112,6 +117,36 @@ async def test_timeout_and_exception_become_error_results_without_stopping_other
     assert records["broken"].score is None and records["broken"].explanation is None
 
 
+async def test_errors_are_debug_logged_with_ids_and_class_name_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = Runner(
+        [
+            FakeJudge(name="slow", timeout_s=0.05, delay_s=1),
+            FakeJudge(name="broken", fail_with=ValueError),
+        ],
+        default_timeout_s=5,
+    )
+    with caplog.at_level(logging.DEBUG, logger="llm_eval_otel"):
+        await runner.run(interaction())
+    trace = f"trace={'01' * 16} span={'02' * 8} service=svc"
+    assert f"slow {trace}: error=timeout" in caplog.text
+    assert f"broken {trace}: error=ValueError" in caplog.text
+    assert "529.982.247-25" not in caplog.text
+
+
+async def test_debug_logs_label_and_score_without_content_or_explanation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = Runner([PIIDetector()], default_timeout_s=5)
+    with caplog.at_level(logging.DEBUG, logger="llm_eval_otel"):
+        await runner.run(interaction(text="CPF 529.982.247-25"))
+    assert "pii_detection trace=" in caplog.text
+    assert "label=fail score=" in caplog.text
+    assert "529.982.247-25" not in caplog.text
+    assert "cpf=1" not in caplog.text
+
+
 async def test_exempt_service_keeps_findings_and_drops_score() -> None:
     runner = Runner(
         [PIIDetector(), SecretDetector()],
@@ -154,3 +189,38 @@ def test_truncate_budget_spans_messages() -> None:
     assert not truncated and i2 == i
     i3, truncated = truncate(i, 2)
     assert truncated and i3.input_messages == [Message("user", "ab")]
+
+
+def test_truncate_keeps_the_output_first_then_input_then_system() -> None:
+    i = dataclasses.replace(
+        interaction(text="i" * 10),
+        system_instructions=[Message("system", "s" * 10)],
+        output_messages=[Message("assistant", "o" * 10)],
+    )
+    cut, truncated = truncate(i, 15)
+    assert truncated
+    assert cut.output_messages == [Message("assistant", "o" * 10)]
+    assert cut.input_messages == [Message("user", "i" * 5)]
+    assert cut.system_instructions == []
+
+
+def test_truncate_keeps_part_offsets() -> None:
+    parts = (PartSpan("reasoning", 0, 8), PartSpan("text", 9, 15), PartSpan("tool_call", 16, 24))
+    i = dataclasses.replace(
+        interaction(text=""),
+        input_messages=[],
+        output_messages=[Message("assistant", 'pensando\npronto\n{"a": 1}', parts)],
+    )
+    cut, _ = truncate(i, 12)
+    [message] = cut.output_messages
+    assert message.parts == (PartSpan("reasoning", 0, 8), PartSpan("text", 9, 12))
+    assert message.text_of("text") == "pro"
+
+
+async def test_exempt_judge_is_not_called() -> None:
+    judge = FakeJudge(delay_s=10)
+    runner = Runner([judge], default_timeout_s=5, exceptions={"svc": ["fake_judge"]})
+    [record] = await runner.run(interaction())
+    assert record.result.label == "exempt"
+    assert record.result.explanation == "exempt service; not evaluated"
+    assert record.result.score is None and record.end_ns == record.start_ns

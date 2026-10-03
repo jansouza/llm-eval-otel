@@ -58,6 +58,9 @@ class GenAIInteraction:
     association_properties: Mapping[str, str] = field(default_factory=dict)
     output_type: str | None = None  # gen_ai.output.type: text | json | image | speech
     finish_reasons: tuple[str, ...] = ()  # gen_ai.response.finish_reasons, one per output
+    # Up to the last few user/assistant text messages before this turn, capped in size, so a
+    # judge can read a follow-up question ("and in English?"). Heuristics ignore it.
+    context_messages: list[Message] = field(default_factory=list)
 
 
 class EvaluatorKind(StrEnum):

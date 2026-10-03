@@ -1,0 +1,24 @@
+# The demo stack with a real judge and the labeled synthetic set instead of the fixed cases:
+#   docker compose -f deploy/docker-compose.yaml -f deploy/docker-compose.judge.yaml up --build
+# Send the set again without restarting the stack, with a new seed: the same seed repeats
+# the trace and span IDs, which the service drops as duplicates for 10 minutes.
+#   GENERATOR_SEED=2 docker compose -f deploy/docker-compose.yaml -f deploy/docker-compose.judge.yaml run --rm span-generator
+#
+# The judge comes from ../.env (LLM_EVAL_JUDGE_*, OPENAI_API_KEY; see .env.example). The
+# variables below replace the demo's and win over the file, so the service exports to the
+# compose Collector and judges every span whatever .env says. Each span is one judge call:
+# 29 per run of the set (bank-chatbot is exempt).
+services:
+  llm-eval-otel:
+    env_file: ../.env
+    environment: !override
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4319
+      OTEL_METRIC_EXPORT_INTERVAL: "5000"
+      LLM_EVAL_EVALUATORS: pii_detection,secret_detection,refusal,system_prompt_leak,output_format,relevance
+      LLM_EVAL_EXCEPTIONS: '{"bank-chatbot": ["pii_detection", "relevance"]}'
+      LLM_EVAL_SAMPLE_RATES: relevance=1.0
+    depends_on: !override
+      otel-collector: { condition: service_started }
+
+  span-generator:
+    command: ["--endpoint", "http://otel-collector:4318/v1/traces", "--dataset", "/tools/data/relevance-synthetic.jsonl", "--seed", "${GENERATOR_SEED:-1}"]

@@ -1,0 +1,55 @@
+# Fan-out: traces/backend forwards everything unchanged; traces/genai sends only GenAI
+# inference spans to the evaluator. The evaluator's output comes back on otlp/eval,
+# whose pipelines export only to the backend, so evaluation telemetry never loops back.
+receivers:
+  otlp:                          # applications
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+  otlp/eval:                     # evaluator output only
+    protocols:
+      http: { endpoint: 0.0.0.0:4319 }
+
+processors:
+  batch: {}
+  filter/genai_inference:        # drops what is not a GenAI inference span
+    error_mode: ignore
+    trace_conditions:
+      - >-
+        not (IsMatch(span.attributes["gen_ai.operation.name"], "^(chat|text_completion|generate_content)$")
+        or span.attributes["gen_ai.prompt.0.content"] != nil)
+
+exporters:
+  otlp_http/evaluator:
+    endpoint: http://llm-eval-otel:4318
+    compression: gzip            # exporter default; the service accepts it
+    sending_queue: { enabled: true }
+    retry_on_failure: { enabled: true }
+  otlp_grpc/backend:
+    endpoint: backend:4317       # the grafana/otel-lgtm container in the compose example
+    tls: { insecure: true }      # local example only
+  file/e2e:                      # read by the end-to-end test
+    path: /data/eval-output.jsonl
+
+service:
+  pipelines:
+    traces/backend:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/backend]
+    traces/genai:
+      receivers: [otlp]
+      processors: [filter/genai_inference, batch]
+      exporters: [otlp_http/evaluator]
+    traces/eval:
+      receivers: [otlp/eval]
+      processors: [batch]
+      exporters: [otlp_grpc/backend, file/e2e]
+    logs/eval:
+      receivers: [otlp/eval]
+      processors: [batch]
+      exporters: [otlp_grpc/backend, file/e2e]
+    metrics/eval:
+      receivers: [otlp/eval]
+      processors: [batch]
+      exporters: [otlp_grpc/backend, file/e2e]

@@ -18,7 +18,7 @@ def test_startup_log_lists_evaluators_and_config_without_secrets(
         log_startup(settings)
     lines = caplog.messages
     assert lines[0] == (
-        "evaluators available: output_format, pii_detection, refusal, secret_detection, "
+        "evaluators available: output_format, pii_detection, refusal, relevance, secret_detection, "
         "system_prompt_leak"
     )
     assert lines[1] == "evaluators enabled: pii_detection, refusal"

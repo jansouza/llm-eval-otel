@@ -13,10 +13,13 @@ dependencies = [
     "opentelemetry-sdk==1.45.0",
     "opentelemetry-proto==1.45.0",
     "opentelemetry-exporter-otlp-proto-http==1.45.0",
+    "openai==3.22.1",
+    "python-dotenv==1.2.3",
 ]
 
 [project.scripts]
 llm-eval-otel = "llm_eval_otel.main:run"
+llm-eval-judge = "llm_eval_otel.cli:run"
 
 [project.entry-points."llm_eval.evaluators"]
 pii_detection = "llm_eval_otel.evaluators.pii:PIIDetector"
@@ -24,6 +27,7 @@ secret_detection = "llm_eval_otel.evaluators.secrets:SecretDetector"
 refusal = "llm_eval_otel.evaluators.refusal:RefusalDetector"
 system_prompt_leak = "llm_eval_otel.evaluators.prompt_leak:SystemPromptLeakDetector"
 output_format = "llm_eval_otel.evaluators.output_format:OutputFormatValidator"
+relevance = "llm_eval_otel.evaluators.relevance:RelevanceJudge"
 
 [dependency-groups]
 dev = [
@@ -71,4 +75,6 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests/unit"]
+# tools/fake_judge_server.py is imported by the judge adapter tests.
+pythonpath = ["tools"]
 markers = ["e2e: end-to-end test that needs docker compose"]

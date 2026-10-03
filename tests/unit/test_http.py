@@ -113,6 +113,10 @@ async def test_full_queue_is_429_with_retry_after(
         assert response.status_code == 429
         assert response.headers["retry-after"] == "5"
         assert (await client.get("/readyz")).status_code == 503
+    messages = otel_memory.caplog.messages
+    assert "rejected export from 127.0.0.1: 429 queue full" in messages
+    assert messages.count("queue full (2 interactions): answering 429 until it drains") == 1
+    assert service.activity.rejected == {429: 1}
 
 
 async def test_auth_token(make_service: ServiceFactory) -> None:

@@ -8,6 +8,7 @@ zero-argument callable (usually the class) that returns an :class:`Evaluator`.
 import logging
 from collections.abc import Iterable
 from importlib.metadata import entry_points
+from typing import Any
 
 from llm_eval_otel.evaluators.base import Evaluator
 
@@ -25,16 +26,20 @@ def available() -> dict[str, str]:
     return {ep.name: ep.value for ep in entry_points(group=ENTRY_POINT_GROUP)}
 
 
-def load(names: Iterable[str]) -> list[Evaluator]:
+def factory(name: str) -> Any:
+    """The object an evaluator's entry point resolves to, usually its class."""
     registered = {ep.name: ep for ep in entry_points(group=ENTRY_POINT_GROUP)}
+    if name not in registered:
+        raise EvaluatorLoadError(
+            f"evaluator {name!r} is not registered; available: {sorted(registered)}"
+        )
+    return registered[name].load()
+
+
+def load(names: Iterable[str]) -> list[Evaluator]:
     evaluators: list[Evaluator] = []
     for name in names:
-        if name not in registered:
-            raise EvaluatorLoadError(
-                f"evaluator {name!r} is not registered; available: {sorted(registered)}"
-            )
-        factory = registered[name].load()
-        evaluator = factory()
+        evaluator = factory(name)()
         if not isinstance(evaluator, Evaluator):
             raise EvaluatorLoadError(f"entry point {name!r} does not implement Evaluator")
         if evaluator.name != name:

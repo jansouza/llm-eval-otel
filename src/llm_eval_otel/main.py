@@ -28,6 +28,7 @@ def build_app(service: Service) -> FastAPI:
         finally:
             log.info("shutting down: draining %d queued interactions", service.queue.size)
             await service.shutdown()
+            log.info("shutdown complete")
 
     return create_app(service, lifespan=lifespan)
 
@@ -46,9 +47,16 @@ def log_startup(settings: Settings) -> None:
 
 def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # The judge's SDK logs every retry, and its HTTP client (httpx2 since openai 3) every
+    # request, at INFO: a line per judge call. The summary and the failing/recovered lines
+    # already say how the judge is doing.
+    for noisy in ("openai", "httpx", "httpx2"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     log.info("starting llm-eval-otel %s", __version__)
     apply_otel_defaults()
     settings = Settings()
+    # Only the service's loggers: DEBUG on the root would also turn on httpx and openai.
+    log.setLevel(settings.log_level)
     log_startup(settings)
     evaluators = registry.load(settings.evaluators)
     service = Service(settings, sdk.build_otlp(), evaluators)

@@ -1,6 +1,12 @@
 import asyncio
+import json
+import random
+import threading
 
+import pytest
 from conftest import OtelMemory, ServiceFactory
+from fake_judge_server import FakeJudgeServer
+from judge_fakes import FakeJudgeClient, relevance
 from opentelemetry._logs import SeverityNumber
 from otlp import (
     SPAN_ID,
@@ -13,8 +19,14 @@ from otlp import (
     text,
 )
 
+from llm_eval_otel.config import Settings
+from llm_eval_otel.engine.queue import QueueFull
 from llm_eval_otel.engine.service import Service
 from llm_eval_otel.evaluators import registry
+from llm_eval_otel.evaluators.pii import PIIDetector
+from llm_eval_otel.evaluators.relevance import RelevanceJudge
+from llm_eval_otel.evaluators.secrets import SecretDetector
+from llm_eval_otel.judge.openai_adapter import OpenAIJudge
 
 CPF = "529.982.247-25"
 AWS = "AKIAIOSFODNN7EXAMPLE"
@@ -198,6 +210,52 @@ async def test_shutdown_drains_and_stops_accepting(
     await service.shutdown()
     assert not service.accepting
     assert len(otel_memory.events("gen_ai.evaluation.result")) == 20
+    [summary] = [m for m in otel_memory.caplog.messages if m.startswith("last ")]
+    assert "received=10 queued=10" in summary
+
+
+async def test_periodic_summary_counts_without_content(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    service = make_service(log_summary_interval_s=0.05)
+    service.ingest(
+        make_request(
+            make_span(semconv_attrs([text("user", f"CPF {CPF}")]), span_id=b"\x01" * 8),
+            make_span({"gen_ai.operation.name": "embeddings"}, span_id=b"\x02" * 8),
+        )
+    )
+    await service.drain()
+    await asyncio.sleep(0.12)
+    summaries = [r for r in otel_memory.caplog.records if r.message.startswith("last ")]
+    first = summaries[0]
+    assert first.levelname == "INFO"
+    assert "received=2 queued=1 skipped=not_inference:1 rejected=none" in first.message
+    assert "pii_detection=1 (fail:1) secret_detection=1 (pass:1)" in first.message
+    assert first.message.endswith("| queue=0/100 llm_judge=0/1000")
+    # The next interval starts from zero.
+    assert "received=0 queued=0" in summaries[1].message
+    assert CPF not in otel_memory.serialize_all()
+
+
+async def test_queue_full_is_logged_once_until_it_accepts_again(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    service = make_service(queue_max=1, workers=0)  # nobody drains the queue yet
+    service.ingest(chat_request("oi", span_id=b"\x01" * 8))
+    for n in range(2, 5):
+        with pytest.raises(QueueFull):
+            service.ingest(chat_request("oi", span_id=bytes([n]) * 8))
+    # A batch with nothing new passes even a full queue; it doesn't mean there is room.
+    service.ingest(make_request(make_span({"gen_ai.operation.name": "embeddings"})))
+    assert service.rejecting
+    service.queue.workers = 1
+    service.queue.start()
+    await service.drain()
+    service.ingest(chat_request("oi", span_id=b"\x09" * 8))
+    messages = otel_memory.caplog.messages
+    assert messages.count("queue full (1 interactions): answering 429 until it drains") == 1
+    assert messages.count("queue accepting again (1/1)") == 1
+    assert not service.rejecting
 
 
 async def test_heuristics_do_not_block_the_event_loop(service: Service) -> None:
@@ -284,3 +342,126 @@ async def test_new_evaluators_flag_without_leaking(
     dump = otel_memory.serialize_all()
     for value in (CNPJ, "11222333000181", PHONE, "98765-4321", PIX, "PORTO-ALFA-77", "ouvidoria"):
         assert value not in dump
+
+
+JUDGE_MODEL = "gpt-5-mini-2025-08-07"
+EMAIL = "maria@example.com"
+
+
+async def test_relevance_with_the_openai_adapter_leaks_nothing(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    """The whole path: the real adapter against the fake server, then the telemetry."""
+    server = FakeJudgeServer(("127.0.0.1", 0))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        judge = OpenAIJudge(model=JUDGE_MODEL, base_url=server.base_url, api_key="test")
+        service = make_service(
+            [PIIDetector(), SecretDetector(), RelevanceJudge(judge, Settings())],
+            sample_rates={"relevance": 1.0},
+        )
+        inputs = [
+            text("user", f"Meu e-mail é {EMAIL}"),
+            text("assistant", "Anotado."),
+            text("user", f"Meu CPF é {CPF} e a chave {AWS}: qual o saldo da conta?"),
+        ]
+        outputs = [text("assistant", f"O saldo da conta do CPF {CPF} é R$ 10.")]
+        service.ingest(make_export_request(input_messages=inputs, output_messages=outputs))
+        await service.drain()
+    finally:
+        server.shutdown()
+
+    [event] = otel_memory.events("gen_ai.evaluation.result", name="relevance")
+    attrs = event.log_record.attributes or {}
+    assert attrs["gen_ai.evaluation.score.label"] == "pass"
+    assert attrs["llm_eval.judge.raw_score"] == 5
+    assert attrs["llm_eval.judge.model"] == JUDGE_MODEL
+
+    [evaluate] = otel_memory.spans("evaluate relevance")
+    [chat] = otel_memory.spans(f"chat {JUDGE_MODEL}")
+    assert chat.parent is not None and chat.parent.span_id == evaluate.context.span_id
+    chat_attrs = dict(chat.attributes or {})
+    assert chat_attrs["gen_ai.operation.name"] == "chat"
+    assert chat_attrs["gen_ai.provider.name"] == "openai"
+    assert chat_attrs["gen_ai.request.model"] == JUDGE_MODEL
+    assert chat_attrs["gen_ai.response.model"] == JUDGE_MODEL
+    assert chat_attrs["server.address"] == "127.0.0.1"
+    assert chat_attrs["server.port"] == server.server_address[1]
+    assert chat_attrs["gen_ai.usage.input_tokens"] > 0
+    assert chat_attrs["gen_ai.usage.output_tokens"] > 0
+    assert chat_attrs["gen_ai.response.finish_reasons"] == ("stop",)
+    assert not any(
+        k.startswith(("gen_ai.input", "gen_ai.output", "gen_ai.system")) for k in chat_attrs
+    )
+    tokens = {"gen_ai.evaluation.name": "relevance", "gen_ai.token.type": "input"}
+    assert otel_memory.histogram_count("gen_ai.client.token.usage", tokens) == 1
+    assert otel_memory.histogram_count("gen_ai.client.operation.duration") == 1
+
+    # Nothing sensitive reached the judge (masked) or the output (sanitized).
+    sent = json.dumps(server.requests, ensure_ascii=False)
+    for value in (CPF, "52998224725", AWS, EMAIL):
+        assert value not in sent
+        assert value not in otel_memory.serialize_all()
+    assert "[CPF]" in sent and "[EMAIL]" in sent and "[SECRET]" in sent
+
+
+async def test_judge_reason_quoting_pii_is_redacted(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    client = FakeJudgeClient(reason=f"the answer repeats the CPF {CPF} instead of answering")
+    service = make_service([relevance(client)], sample_rates={"relevance": 1.0})
+    service.ingest(chat_request("Qual o horário?"))
+    await service.drain()
+    [event] = otel_memory.events("gen_ai.evaluation.result", name="relevance")
+    assert (event.log_record.attributes or {})["gen_ai.evaluation.explanation"] == "[REDACTED]"
+    assert (
+        otel_memory.counter(
+            "llm_eval.sanitizer.redactions", {"gen_ai.evaluation.name": "relevance"}
+        )
+        == 1
+    )
+    assert CPF not in otel_memory.serialize_all()
+
+
+async def test_relevance_runs_on_about_five_percent_of_traces(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    client = FakeJudgeClient()
+    service = make_service([PIIDetector(), relevance(client)], queue_max=1000)
+    rng = random.Random(5)
+    for _ in range(400):
+        service.ingest(chat_request("Qual o horário?", trace_id=rng.randbytes(16)))
+    await service.drain()
+    judged = len(otel_memory.events("gen_ai.evaluation.result", name="relevance"))
+    assert 5 <= judged <= 40
+    assert len(otel_memory.events("gen_ai.evaluation.result", name="pii_detection")) == 400
+
+
+async def test_judge_input_is_truncated_and_marked(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    client = FakeJudgeClient()
+    evaluator = relevance(client)
+    evaluator.max_chars = 50
+    service = make_service([evaluator], sample_rates={"relevance": 1.0})
+    service.ingest(chat_request("pergunta " * 20))
+    await service.drain()
+    [event] = otel_memory.events("gen_ai.evaluation.result", name="relevance")
+    assert (event.log_record.attributes or {})["llm_eval.content.truncated"] is True
+    request = json.loads(client.received[0].split("\n")[1])["request"][0]
+    assert len(request) == 50 - len("Anotado.")  # the output is kept first
+
+
+async def test_own_spans_sent_back_are_skipped(service: Service, otel_memory: OtelMemory) -> None:
+    """The evaluator's output must never loop back; if it does, it is not evaluated."""
+    own = make_request(
+        make_span(semconv_attrs([text("user", f"CPF {CPF}")])), service_name="llm-eval-otel-test"
+    )
+    outcome = service.ingest(own)
+    await service.drain()
+    assert outcome.queued == 0 and outcome.skipped == {"self_telemetry": 1}
+    assert (
+        otel_memory.counter("llm_eval.spans.skipped", {"llm_eval.skip.reason": "self_telemetry"})
+        == 1
+    )
+    assert otel_memory.events("gen_ai.evaluation.result") == []

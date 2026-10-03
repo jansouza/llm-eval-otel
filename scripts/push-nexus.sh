@@ -15,16 +15,18 @@
 #   CONTAINER_CLI    docker or podman                               default: docker
 #   TLS_VERIFY       podman only: "false" for an HTTP Nexus         default: true
 #
-# These variables are also read from .env at the repository root, when it exists.
+# These variables are also read from scripts/.env (next to this script), when it exists.
 # A variable already set in the environment takes precedence over the file.
 #
 # Docker already treats localhost registries as insecure. For any other HTTP host,
 # add it to "insecure-registries" in /etc/docker/daemon.json.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+env_file="${script_dir}/.env"
+cd "${script_dir}/.."
 
-if [[ -f .env ]]; then
+if [[ -f "$env_file" ]]; then
     declare -A preset=()
     for var in NEXUS_REGISTRY NEXUS_NAMESPACE NEXUS_USER NEXUS_PASSWORD \
         IMAGE_NAME PLATFORM CONTAINER_CLI TLS_VERIFY; do
@@ -32,10 +34,10 @@ if [[ -f .env ]]; then
             preset[$var]="${!var}"
         fi
     done
-    echo "==> Reading .env"
+    echo "==> Reading ${env_file}"
     set -a
     # shellcheck source=/dev/null
-    source .env
+    source "$env_file"
     set +a
     for var in "${!preset[@]}"; do
         export "$var=${preset[$var]}"

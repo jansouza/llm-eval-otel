@@ -5,6 +5,7 @@ right cases: 429 (queue full, with Retry-After) is retried; 400 is not.
 """
 
 import hmac
+import logging
 import zlib
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
@@ -18,6 +19,8 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
 
 from llm_eval_otel.engine.queue import QueueFull
 from llm_eval_otel.engine.service import Service
+
+log = logging.getLogger(__name__)
 
 PROTOBUF = "application/x-protobuf"
 RETRY_AFTER_S = "5"
@@ -66,21 +69,30 @@ def create_app(
     settings = service.settings
     expected_auth = f"Bearer {settings.auth_token}" if settings.auth_token else None
 
+    def _reject(
+        request: Request, status: int, message: str, headers: dict[str, str] | None = None
+    ) -> Response:
+        """A refused export: DEBUG with the peer and the reason, counted in the summary."""
+        peer = request.client.host if request.client else "unknown"
+        log.debug("rejected export from %s: %d %s", peer, status, message)
+        service.record_rejected(status)
+        return _text(status, message, headers)
+
     @app.post("/v1/traces")
     async def export_traces(request: Request) -> Response:
         if expected_auth is not None and not hmac.compare_digest(
             request.headers.get("authorization", "").encode(), expected_auth.encode()
         ):
-            return _text(401, "unauthorized")
+            return _reject(request, 401, "unauthorized")
         if not service.accepting:
-            return _text(503, "shutting down", {"Retry-After": RETRY_AFTER_S})
+            return _reject(request, 503, "shutting down", {"Retry-After": RETRY_AFTER_S})
 
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         if content_type != PROTOBUF:
-            return _text(415, f"only {PROTOBUF} is supported")
+            return _reject(request, 415, f"only {PROTOBUF} is supported")
         encoding = request.headers.get("content-encoding", "identity").strip().lower()
         if encoding not in ("identity", "gzip"):
-            return _text(415, "only gzip content-encoding is supported")
+            return _reject(request, 415, "only gzip content-encoding is supported")
 
         limit = settings.max_request_bytes
         try:
@@ -89,15 +101,15 @@ def create_app(
                 body = gunzip(body, limit)
             export = ExportTraceServiceRequest.FromString(body)
         except PayloadTooLarge:
-            return _text(413, "request too large")
+            return _reject(request, 413, "request too large")
         except (BadEncoding, DecodeError):
             service.record_invalid_payload()
-            return _text(400, "invalid payload")
+            return _reject(request, 400, "invalid payload")
 
         try:
             service.ingest(export)
         except QueueFull:
-            return _text(429, "queue full", {"Retry-After": RETRY_AFTER_S})
+            return _reject(request, 429, "queue full", {"Retry-After": RETRY_AFTER_S})
         return Response(ExportTraceServiceResponse().SerializeToString(), media_type=PROTOBUF)
 
     @app.get("/healthz")

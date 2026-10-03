@@ -6,7 +6,7 @@ service needs are applied in :func:`apply_otel_defaults`.
 
 import json
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -46,6 +46,22 @@ class Settings(BaseSettings):
     tls_cert_file: str | None = None
     tls_key_file: str | None = None
     drain_timeout_s: float = 30.0
+    # The service's own loggers (llm_eval_otel.*); DEBUG logs every request and evaluation.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    log_summary_interval_s: float = 60.0  # one summary line per interval; 0 turns it off
+
+    # LLM-as-a-Judge. The API key is the SDK's own OPENAI_API_KEY.
+    judge_model: str | None = None  # required when a judge evaluator is enabled
+    judge_base_url: str | None = None  # None = the OpenAI API; else any compatible server
+    judge_response_format: Literal["json_schema", "json_object", "none"] = "json_schema"
+    judge_temperature: float | None = None  # sent only when set
+    judge_reasoning_effort: str | None = None  # sent only when set
+    judge_max_output_tokens: int = 1024
+    judge_max_concurrency: int = 8
+    judge_queue_max: int = 1000
+    judge_tokens_per_minute: int | None = None  # None = no budget
+    judge_redact: bool = True
+    judge_explanation: bool = True
 
     @field_validator("evaluators", "association_exclude", "pii_types", mode="before")
     @classmethod
@@ -53,6 +69,11 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [name.strip() for name in value.split(",") if name.strip()]
         return value
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper_level(cls, value: object) -> object:
+        return value.strip().upper() if isinstance(value, str) else value
 
     @field_validator("sample_rates", mode="before")
     @classmethod
