@@ -20,7 +20,7 @@ uv run pytest tests/e2e -m e2e            # needs Docker compose; builds the ima
 ```
 
 - Demo stack (synthetic spans → Collector → service → Grafana LGTM on :3000): `docker compose -f deploy/docker-compose.yaml up --build`
-- Latency/throughput benchmark: `uv run python tools/load_test.py --spans 3000 --text-kb 10` (README's Performance table was measured with this). `--judge slow|down` adds `relevance` against the fake judge (5 s per call) or a closed port.
+- Latency/throughput benchmark: `uv run python tools/load_test.py --spans 3000 --text-kb 10` (the Performance table in `docs/operations.md` was measured with this). `--judge slow|down` adds `relevance` against the fake judge (5 s per call) or a closed port.
 - Judge from the command line: `uv run llm-eval-judge -i "question" -o "answer"` (or `--jsonl`, `--dry-run` to see the masked content without calling). `src/llm_eval_otel/cli.py`; reads `./.env` without overriding the environment (`.env.example` lists the variables; the service itself never reads `.env`).
 - Judge calibration: `uv run python tools/benchmark.py <labeled.jsonl>` with `LLM_EVAL_JUDGE_*` and `OPENAI_API_KEY` set. `tools/fake_judge_server.py` is a deterministic OpenAI-compatible judge (stdlib only) for tests, the demo and the load test.
 - `scripts/push-nexus.sh` pushes a dev image to a local Nexus; real releases are `v*` tags, built by `release.yml` to GHCR.
@@ -72,4 +72,4 @@ Request flow, one module per stage under `src/llm_eval_otel/`:
 
 ## Docs
 
-`docs/spec.md` (the design spec) and `docs/plans/eval-v0-{2,3,4}-plan.md` (roadmap: more heuristics, then LLM-as-a-Judge via the OpenAI SDK and compatible servers, then local classifiers) are written in Portuguese. The README is the user-facing reference for configuration and telemetry.
+`docs/spec.md` (the design spec) and `docs/plans/eval-v0-{2,3,4}-plan.md` (roadmap: more heuristics, then LLM-as-a-Judge via the OpenAI SDK and compatible servers, then local classifiers) are written in Portuguese. The README is the short user-facing entry point; the reference for evaluators, the judge, configuration, operations and telemetry is in English in `docs/{evaluators,judge,configuration,operations,telemetry,development}.md`.

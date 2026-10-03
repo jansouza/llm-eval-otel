@@ -3,7 +3,7 @@
 The version is `service.version` on everything the service emits, so it identifies the
 detection rules behind each result. The minor version goes up whenever what gets detected
 changes (a new type, evaluator or threshold); the patch version for fixes that don't change
-detection. See [Versioning](README.md#versioning).
+detection. See [Versioning](docs/development.md#versioning).
 
 ## [Unreleased]
 
