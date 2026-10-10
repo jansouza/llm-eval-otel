@@ -1,4 +1,4 @@
-# Plano — avaliadores v0.4
+# Plano — classificadores locais
 
 30/09/2026 · Jan Souza
 
@@ -17,7 +17,7 @@ São os primeiros avaliadores com `kind = model`. A spec diz que os candidatos p
 Resultado esperado:
 
 - Os três avaliadores, validados num conjunto em português, rodando no mesmo processo que as heurísticas.
-- O `pii_ner` também serve ao juiz da [v0.3](eval-v0-3-plan.md): mascara nomes e endereços antes do envio e pode passar a justificativa do juiz.
+- O `pii_ner` também serve ao juiz da [v0.3](eval-llm-judge-plan.md): mascara nomes e endereços antes do envio e pode passar a justificativa do juiz.
 - As heurísticas continuam vendo 100% dos spans e mantêm a vazão medida na v0.2, mesmo com os modelos ligados e sobrecarregados.
 - A imagem padrão continua pequena. Quem quer os modelos usa uma imagem separada, e os pesos não vão dentro de nenhuma das duas.
 
@@ -84,7 +84,7 @@ Configuração nova:
 | `LLM_EVAL_MODEL_DEVICE` | `cpu` | `cpu` ou `cuda` |
 | `LLM_EVAL_PII_NER_ALLOWLIST` | vazio | nomes que o `pii_ner` ignora, como o nome da persona do assistente |
 | `LLM_EVAL_JUDGE_REDACT_NER` | `false` | mascara também nomes e endereços antes de enviar ao juiz (exige `pii_ner`) |
-| `LLM_EVAL_JUDGE_SANITIZE_NER` | `false` | passa a explicação do juiz pelo `pii_ner` |
+| `LLM_EVAL_LLM_JUDGE_SANITIZE_NER` | `false` | passa a explicação do juiz pelo `pii_ner` |
 
 As threads internas do `torch` ficam em `cpus disponíveis // LLM_EVAL_MODEL_THREADS`, para o pool não disputar CPU com ele mesmo.
 
@@ -126,7 +126,7 @@ Todos os três emitem também `llm_eval.evaluator.model`.
 **Uso pelo juiz da v0.3.** O juiz mascara PII e credenciais por regex antes de enviar, mas nomes e endereços passam. Com o `pii_ner` habilitado, duas opções reaproveitam o modelo já carregado:
 
 - `LLM_EVAL_JUDGE_REDACT_NER` mascara nomes e endereços (`[PERSON]`, `[ADDRESS]`) no texto enviado ao juiz, ao custo de uma inferência extra por avaliação amostrada. A inferência roda no pool da faixa `model` antes de a avaliação entrar na faixa `llm_judge`.
-- `LLM_EVAL_JUDGE_SANITIZE_NER` passa a justificativa do juiz pelo `pii_ner` e troca nomes e endereços por `[REDACTED]`, como o sanitizador faz com o resto.
+- `LLM_EVAL_LLM_JUDGE_SANITIZE_NER` passa a justificativa do juiz pelo `pii_ner` e troca nomes e endereços por `[REDACTED]`, como o sanitizador faz com o resto.
 - As duas ficam desligadas por padrão e falham na partida se o `pii_ner` não estiver habilitado.
 
 ## Testes
@@ -148,7 +148,7 @@ Todos os três emitem também `llm_eval.evaluator.model`.
    - Pronto quando: o avaliador reproduz no serviço os números da etapa 1 e o teste ponta a ponta encontra o evento com `llm_eval.evaluator.model`.
 5. **`prompt_injection`.** Janelas de 512 tokens e leitura das mensagens de ferramenta.
    - Pronto quando: injeção direta e injeção dentro de um resultado de ferramenta dão `fail`, e os benignos da etapa 1 ficam na taxa de falso positivo aprovada.
-6. **`pii_ner`.** Presidio com spaCy em português, reconhecedor de endereço, lista de exceção, `LLM_EVAL_JUDGE_REDACT_NER` e `LLM_EVAL_JUDGE_SANITIZE_NER`.
+6. **`pii_ner`.** Presidio com spaCy em português, reconhecedor de endereço, lista de exceção, `LLM_EVAL_JUDGE_REDACT_NER` e `LLM_EVAL_LLM_JUDGE_SANITIZE_NER`.
    - Pronto quando: nome e endereço dão `fail`; cidade sozinha, marca e o nome da lista de exceção dão `pass`; com as opções do juiz ligadas, o juiz falso não recebe nomes e uma justificativa com nome sai com `[REDACTED]`.
 7. **Demonstração e documentação.** Perfil `models` no compose, casos no gerador, teste de carga, spec atualizada (evento, configuração, auto-observabilidade, roadmap) e README com capacidade medida por réplica, licenças dos modelos e o passo do `models pull`.
    - Pronto quando: as metas estão medidas e registradas no README.

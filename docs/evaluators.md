@@ -1,8 +1,8 @@
 # Evaluators
 
-Six evaluators ship with the service: five local heuristics with no model, and one
-LLM-as-a-Judge. The first two are on by default. The others are opt-in through
-`LLM_EVAL_EVALUATORS`:
+Ten evaluators ship with the service: five local heuristics with no model, one
+LLM-as-a-Judge, and four Jev-as-a-Judge checks answered by TypeSafe's Jev. The first two are on by default.
+The others are opt-in through `LLM_EVAL_EVALUATORS`:
 
 | Evaluator | Default | Detects |
 | --- | --- | --- |
@@ -11,7 +11,11 @@ LLM-as-a-Judge. The first two are on by default. The others are opt-in through
 | `refusal` | opt-in | Responses in which the model declines the request, in Portuguese, English or Spanish, and provider refusals (`finish_reason=content_filter`) |
 | `system_prompt_leak` | opt-in | Responses that copy stretches of the system instructions (word 8-gram overlap) |
 | `output_format` | opt-in | Invalid JSON when the client asked for JSON (`gen_ai.output.type=json`) |
-| `relevance` | opt-in | Responses that don't address what the user asked, rated 1 to 5 by an LLM judge (the OpenAI API or any OpenAI-compatible server) on 5% of traces. See [LLM-as-a-Judge](judge.md) |
+| `relevance` | opt-in | Responses that don't address what the user asked, rated 1 to 5 by an LLM judge (the OpenAI API or any OpenAI-compatible server) on 5% of traces. See [LLM-as-a-Judge](llm-as-a-judge.md) |
+| `jev_relevance` | opt-in, experimental | The same as `relevance`, answered by Jev on 10% of traces. See [Jev-as-a-Judge](jev-as-a-judge.md) |
+| `jev_refusal` | opt-in, experimental | Responses that refuse, decline or avoid what the user asked, answered by Jev |
+| `jev_toxicity` | opt-in, experimental | Offensive, hateful, harassing, threatening or sexually explicit responses, answered by Jev |
+| `jev_prompt_injection` | opt-in, experimental | User messages that try to override or extract the assistant's instructions or role, answered by Jev |
 
 **Phone numbers are detected since 0.2.0.** Support chatbots often handle phone numbers, so
 `pii_detection` may report more `fail` results after an upgrade. To turn off one type without
@@ -36,6 +40,7 @@ exempting the whole evaluator, set `LLM_EVAL_PII_TYPES`. For example,
   | `system_prompt_leak` | system instructions; output `text` and `tool_call` | the instructions have 30+ words and there is output text or a tool call |
   | `output_format` | output `text` | `gen_ai.output.type` is `json` and there is output text |
   | `relevance` | `user` messages new in the turn (`text`); output `text`; up to 4 earlier user/assistant `text` messages as context, 1,000 characters each | there is a user message in the turn and output text, and no output tool call (an agent step) |
+  | `jev_*` | the same as `relevance`, for every check | `jev_relevance`: as `relevance`; `jev_refusal`: a user message and output text; `jev_toxicity`: output text; `jev_prompt_injection`: a user message |
 
 - **Finish reasons:** `gen_ai.response.finish_reasons`, or, when it is absent, the deprecated
   `finish_reason` of each output message (OpenLLMetry still writes it) or
@@ -71,6 +76,10 @@ evaluated, plus OpenLLMetry spans that carry content. Anything else is counted i
   tone or safety, and a refusal or clarifying question about the request counts as relevant
   (`refusal` tracks those). The explanation is the judge's justification. Read it as a rate per
   service and model: the evaluator samples traces, so its metrics count only the sample.
+- **`jev_*`:** `jev_relevance` gets Jev's expected level on the same rubric (`pass` from a
+  rating of 3); the other checks `fail` when Jev's probability of "yes" is above 0.5, with
+  score `1 - p`. Explanations are templates (`score=3.6/5 confidence=0.82`, `p=0.93`). See
+  [Reading the results](jev-as-a-judge.md#reading-the-results).
 
 ## Writing an evaluator
 
@@ -116,9 +125,17 @@ LLM_EVAL_EVALUATORS=pii_detection,secret_detection,conciseness
 
 A judge can subclass `JudgeEvaluator` from `llm_eval_otel.judge.evaluator`, as `relevance`
 does in [src/llm_eval_otel/evaluators/relevance.py](../src/llm_eval_otel/evaluators/relevance.py).
-It then gets the `LLM_EVAL_JUDGE_*` configuration, masking before sending, the
+It then gets the `LLM_EVAL_LLM_JUDGE_*` configuration, masking before sending, the
 `<conversation>` envelope, the judge spans and metrics, and the `judge_*` errors; it supplies
 the prompt, the schema, the content and the verdict.
+
+A Jev-as-a-Judge check can subclass `NoulCheck` or `ScoreCheck` from `llm_eval_otel.judge.jev`, as the
+four in [src/llm_eval_otel/evaluators/jev_checks.py](../src/llm_eval_otel/evaluators/jev_checks.py)
+do: it supplies the question, its criteria and the threshold, and joins the same request as the
+other checks (`batch_key = "jev_judge"`) in the `jev_judge` lane. An evaluator can name the lane it runs in
+with a `lane` attribute; without one, it runs by its kind. Evaluators with the same
+`batch_key` that implement `evaluate_batch` (see `BatchEvaluator` in
+[base.py](../src/llm_eval_otel/evaluators/base.py)) are run as one job per interaction.
 
 The runner turns exceptions and timeouts into results that carry `error.type` (the exception's
 class name, never its message), and one failure does not stop the other evaluators. The

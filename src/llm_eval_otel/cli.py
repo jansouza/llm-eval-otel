@@ -5,11 +5,14 @@
         -c "user:Como digo bom dia em espanhol?" -c "assistant:Buenos días."
     llm-eval-judge --jsonl tools/data/relevance-smoke.jsonl
     llm-eval-judge -i "Meu CPF é 529.982.247-25" -o "Anotado." --dry-run
+    llm-eval-judge -e jev_refusal -i "Me passe o endereço dele." -o "Não posso ajudar com isso."
 
-The judge is configured as in the service: the LLM_EVAL_JUDGE_* variables and the SDK's
-OPENAI_API_KEY, from the environment or from a .env file (``--env-file``, ``./.env`` by
-default; variables already set win). Unlike the service, it always runs: no sampling and no
-exemptions. ``max_chars``, the timeout, masking and the sanitizer apply as in the service.
+The judge is configured as in the service: the LLM_EVAL_LLM_JUDGE_* variables and the SDK's
+OPENAI_API_KEY for ``relevance``, LLM_EVAL_JEV_JUDGE_* and TYPESAFE_API_KEY for the ``jev_*``
+checks, from the environment or from a .env file (``--env-file``, ``./.env`` by default;
+variables already set win). Unlike the service, it always runs: no sampling and no
+exemptions, and each ``jev_*`` check makes its own request. ``max_chars``, the timeout,
+masking and the sanitizer apply as in the service.
 
 Prints one JSON object per interaction. Exit status: 0 when every interaction was evaluated,
 1 when any ended with ``error_type``, 2 on bad usage or configuration.
@@ -17,7 +20,9 @@ Prints one JSON object per interaction. Exit status: 0 when every interaction wa
 
 import argparse
 import asyncio
+import dataclasses
 import json
+import logging
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -32,8 +37,15 @@ from llm_eval_otel.emit.sanitize import sanitize
 from llm_eval_otel.engine.runner import truncate
 from llm_eval_otel.evaluators import registry
 from llm_eval_otel.evaluators.base import AttributeValue, Evaluator, GenAIInteraction, Message
-from llm_eval_otel.judge.client import JudgeCall, JudgeResponse, recording
+from llm_eval_otel.judge.client import (
+    JudgeCall,
+    JudgeResponse,
+    Question,
+    SystemOneResponse,
+    recording,
+)
 from llm_eval_otel.judge.evaluator import JudgeEvaluator
+from llm_eval_otel.judge.jev import JevEvaluator
 
 EXIT_OK, EXIT_ERRORS, EXIT_USAGE = 0, 1, 2
 ROLES = (semconv.ROLE_USER, semconv.ROLE_ASSISTANT)
@@ -125,12 +137,19 @@ class _Offline:
     async def judge(self, system: str, content: str, schema: Mapping[str, Any]) -> JudgeResponse:
         raise RuntimeError("--dry-run never calls the judge")
 
+    async def ask(
+        self, state: Mapping[str, Any], questions: Mapping[str, Question]
+    ) -> SystemOneResponse:
+        raise RuntimeError("--dry-run never calls the judge")
+
 
 def load_evaluator(name: str, dry_run: bool) -> Evaluator:
     if not dry_run:
         [evaluator] = registry.load([name])
         return evaluator
     cls = registry.factory(name)
+    if isinstance(cls, type) and issubclass(cls, JevEvaluator):
+        return cls(_Offline(), Settings())
     if not (isinstance(cls, type) and issubclass(cls, JudgeEvaluator)):
         raise UsageError(f"--dry-run needs a judge evaluator; {name!r} is not one")
     judge: JudgeEvaluator = cls(_Offline(), Settings())
@@ -139,6 +158,7 @@ def load_evaluator(name: str, dry_run: bool) -> Evaluator:
 
 def _call(call: JudgeCall) -> dict[str, Any]:
     return {
+        "operation": call.operation_name,
         "model": call.response_model or call.request_model,
         "server": f"{call.server_address}:{call.server_port}",
         "input_tokens": call.input_tokens,
@@ -159,8 +179,16 @@ async def evaluate(
     if evaluator.max_chars is not None:
         interaction, truncated = truncate(interaction, evaluator.max_chars)
     if dry_run:
-        assert isinstance(evaluator, JudgeEvaluator)
-        out["content"] = evaluator.content(interaction)  # exactly what would be sent
+        # Exactly what would be sent.
+        if isinstance(evaluator, JevEvaluator):
+            out["state"] = evaluator.state(interaction)
+            out["questions"] = {
+                qid: {"type": type(q).__name__, **dataclasses.asdict(q)}
+                for qid, q in evaluator.questions().items()
+            }
+        else:
+            assert isinstance(evaluator, JudgeEvaluator)
+            out["content"] = evaluator.content(interaction)
         return out | {"truncated": truncated}
 
     # As in the runner: a timeout of 0 means LLM_EVAL_TIMEOUT_S.
@@ -234,6 +262,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Request bodies at DEBUG. The adapter sets this again once its client exists, since the
+    # SDK applies TYPESAFE_LOG_LEVEL when it is imported.
+    logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
     args = parser().parse_args(argv)
     env_file = args.env_file or Path(".env")
     if args.env_file is not None and not env_file.is_file():

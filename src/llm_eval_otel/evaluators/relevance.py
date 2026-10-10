@@ -8,7 +8,13 @@ a 1 to 5 rating; the score is ``(rating - 1) / 4`` and ``pass`` is a rating of 3
 from typing import Final
 
 from llm_eval_otel import semconv
-from llm_eval_otel.evaluators.base import EvaluationResult, GenAIInteraction, Message
+from llm_eval_otel.evaluators.base import EvaluationResult, GenAIInteraction
+from llm_eval_otel.evaluators.conversation import (
+    calls_tools,
+    conversation,
+    response_texts,
+    user_texts,
+)
 from llm_eval_otel.judge.client import JudgeResponse
 from llm_eval_otel.judge.evaluator import (
     INJECTION_GUARD,
@@ -63,22 +69,6 @@ SCHEMA: Final = {
 }
 
 
-def _user_texts(messages: list[Message]) -> list[str]:
-    return [
-        text
-        for m in messages
-        if m.role == semconv.ROLE_USER and (text := m.text_of(semconv.PART_TEXT).strip())
-    ]
-
-
-def _response_texts(messages: list[Message]) -> list[str]:
-    return [text for m in messages if (text := m.text_of(semconv.PART_TEXT).strip())]
-
-
-def _calls_tools(messages: list[Message]) -> bool:
-    return any(p.type == semconv.PART_TOOL_CALL for m in messages for p in m.parts)
-
-
 class RelevanceJudge(JudgeEvaluator):
     name = "relevance"
     timeout_s = 30.0
@@ -95,22 +85,13 @@ class RelevanceJudge(JudgeEvaluator):
         ("step 2 of 6"), so the judge would fail every step of a working agent.
         """
         return (
-            bool(_user_texts(interaction.input_messages))
-            and bool(_response_texts(interaction.output_messages))
-            and not _calls_tools(interaction.output_messages)
+            bool(user_texts(interaction.input_messages))
+            and bool(response_texts(interaction.output_messages))
+            and not calls_tools(interaction.output_messages)
         )
 
     def content(self, interaction: GenAIInteraction) -> str:
-        return envelope(
-            {
-                "context": [
-                    {"role": m.role, "text": self.text(m.text)}
-                    for m in interaction.context_messages
-                ],
-                "request": [self.text(t) for t in _user_texts(interaction.input_messages)],
-                "response": [self.text(t) for t in _response_texts(interaction.output_messages)],
-            }
-        )
+        return envelope(conversation(interaction, self.text))
 
     def verdict(self, response: JudgeResponse) -> EvaluationResult:
         rating = int(response.output["score"])

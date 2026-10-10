@@ -47,7 +47,7 @@ async def test_reason_is_cut_to_300_characters() -> None:
 
 
 async def test_explanation_can_be_a_template() -> None:
-    evaluator = relevance(FakeJudgeClient(score=2), judge_explanation=False)
+    evaluator = relevance(FakeJudgeClient(score=2), llm_judge_explanation=False)
     assert (await evaluator.evaluate(chat())).explanation == "score=2/5"
 
 
@@ -174,15 +174,15 @@ def test_schema_validation(output: Any, valid: bool) -> None:
 
 
 def test_judge_model_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("LLM_EVAL_JUDGE_MODEL", raising=False)
-    with pytest.raises(JudgeConfigError, match="relevance needs LLM_EVAL_JUDGE_MODEL"):
+    monkeypatch.delenv("LLM_EVAL_LLM_JUDGE_MODEL", raising=False)
+    with pytest.raises(JudgeConfigError, match="relevance needs LLM_EVAL_LLM_JUDGE_MODEL"):
         registry.load(["relevance"])
 
 
 def test_loads_from_the_entry_point_with_the_openai_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LLM_EVAL_JUDGE_MODEL", "gpt-5-mini-2025-08-07")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_MODEL", "gpt-5-mini-2025-08-07")
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     [evaluator] = registry.load(["relevance"])
     assert (evaluator.name, evaluator.kind, evaluator.sample_rate) == (
@@ -191,4 +191,4 @@ def test_loads_from_the_entry_point_with_the_openai_adapter(
         0.05,
     )
     assert (evaluator.max_chars, evaluator.timeout_s) == (16_000, 30.0)
-    assert Settings().judge_model == "gpt-5-mini-2025-08-07"
+    assert Settings().llm_judge_model == "gpt-5-mini-2025-08-07"

@@ -1,4 +1,4 @@
-"""A scripted, deterministic JudgeClient, and interactions for judge tests."""
+"""Scripted, deterministic judge clients (JudgeClient, SystemOneClient), and interactions."""
 
 import asyncio
 import time
@@ -8,10 +8,35 @@ from typing import Any
 
 from llm_eval_otel.config import Settings
 from llm_eval_otel.evaluators.base import GenAIInteraction, Message
+from llm_eval_otel.evaluators.jev_checks import (
+    JevPromptInjection,
+    JevRefusal,
+    JevRelevance,
+    JevToxicity,
+)
 from llm_eval_otel.evaluators.relevance import RelevanceJudge
-from llm_eval_otel.judge.client import JudgeCall, JudgeError, JudgeResponse, record
+from llm_eval_otel.judge.client import (
+    Answer,
+    JudgeCall,
+    JudgeError,
+    JudgeResponse,
+    NoulAnswer,
+    NoulQuestion,
+    Question,
+    ScoreAnswer,
+    SystemOneResponse,
+    record,
+)
+from llm_eval_otel.judge.jev import JevEvaluator
 
 MODEL = "fake-judge-1"
+JEV_MODEL = "jev-1.13.0"
+JEV_CHECKS: tuple[type[JevEvaluator], ...] = (
+    JevRelevance,
+    JevRefusal,
+    JevToxicity,
+    JevPromptInjection,
+)
 
 
 @dataclass
@@ -61,6 +86,72 @@ class FakeJudgeClient:
 
 def relevance(client: FakeJudgeClient | None = None, **settings: Any) -> RelevanceJudge:
     return RelevanceJudge(client or FakeJudgeClient(), Settings(**settings))
+
+
+@dataclass
+class FakeSystemOneClient:
+    """Answers every question: ``score`` for score questions, ``nouls`` (by id) or 0.1.
+
+    Records every (state, questions) it was sent, and each call as the adapter would.
+    """
+
+    score: float = 4.0  # the expected level, 0 to 4
+    confidence: float = 0.9
+    nouls: dict[str, float] = field(default_factory=dict)
+    delay_s: float = 0.0
+    raise_error: type[Exception] | None = None
+    tokens: tuple[int, int] = (300, 8)  # (input, output)
+    received: list[tuple[dict[str, Any], dict[str, Question]]] = field(default_factory=list)
+
+    async def ask(
+        self, state: Mapping[str, Any], questions: Mapping[str, Question]
+    ) -> SystemOneResponse:
+        start_ns = time.time_ns()
+        self.received.append((dict(state), dict(questions)))
+        error_type = None
+        try:
+            await asyncio.sleep(self.delay_s)
+            if self.raise_error is not None:
+                raise self.raise_error()
+        except asyncio.CancelledError:
+            error_type = "timeout"
+            raise
+        except JudgeError as exc:
+            error_type = exc.error_type
+            raise
+        except Exception as exc:
+            error_type = type(exc).__name__
+            raise
+        finally:
+            record(
+                JudgeCall(
+                    provider_name="typesafe",
+                    request_model=JEV_MODEL,
+                    server_address="fake-judge",
+                    server_port=8080,
+                    start_ns=start_ns,
+                    end_ns=time.time_ns(),
+                    response_model=JEV_MODEL if error_type is None else None,
+                    input_tokens=self.tokens[0] if error_type is None else None,
+                    output_tokens=self.tokens[1] if error_type is None else None,
+                    error_type=error_type,
+                    operation_name="system_one",
+                )
+            )
+        answers: dict[str, Answer] = {}
+        for qid, question in questions.items():
+            if isinstance(question, NoulQuestion):
+                answers[qid] = NoulAnswer(self.nouls.get(qid, 0.1))
+            else:
+                levels = len(question.levels)
+                answers[qid] = ScoreAnswer(self.score, self.confidence, (1 / levels,) * levels)
+        return SystemOneResponse(answers, JEV_MODEL, *self.tokens)
+
+
+def jev_checks(client: FakeSystemOneClient | None = None, **settings: Any) -> list[JevEvaluator]:
+    """The four checks on one client, as the batch uses them."""
+    client = client or FakeSystemOneClient()
+    return [check(client, Settings(**settings)) for check in JEV_CHECKS]
 
 
 def chat(

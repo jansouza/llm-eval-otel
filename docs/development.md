@@ -20,17 +20,20 @@ src/llm_eval_otel/
   extract/genai.py     # span -> GenAIInteraction (two formats)
   engine/queue.py      # bounded queue, dedup, workers
   engine/runner.py     # sampling, timeouts, exemptions, truncation
-  engine/lanes.py      # the judge lane and the token budget
+  engine/lanes.py      # the llm_judge and jev_judge lanes, and the token budget
   engine/service.py    # wires the pieces together
   evaluators/          # base (the contract), pii, secrets, refusal, prompt_leak,
-                       # output_format, relevance, registry (entry points)
-  judge/               # client (contract, errors, call records), openai_adapter,
-                       # evaluator (shared judge code), redact, schema
+                       # output_format, relevance, jev_checks, conversation (what judges
+                       # read), registry (entry points)
+  judge/               # client (contracts, errors, call records), openai_adapter,
+                       # typesafe_adapter, evaluator (shared judge code), jev (shared Jev
+                       # check code and the batch), redact, schema
   version.py           # the version, also service.version
   emit/                # sdk (providers), emitter (event, span, metrics), sanitize
 tools/span_generator.py    # synthetic spans for the demo
-tools/fake_judge_server.py # deterministic OpenAI-compatible judge for tests and the demo
-tools/benchmark.py         # an evaluator against a labeled set: agreement, tokens, cost
+tools/fake_judge_server.py # deterministic OpenAI-compatible judge and System One API
+tools/benchmark.py         # an evaluator against a labeled set (and --against another)
+tools/data/                # labeled sets: relevance, refusal, toxicity, injection
 tools/load_test.py         # latency and throughput measurement
 deploy/                    # Collector config and docker compose
 ```

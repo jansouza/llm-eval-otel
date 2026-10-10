@@ -7,6 +7,54 @@ detection. See [Versioning](docs/development.md#versioning).
 
 ## [Unreleased]
 
+## [0.4.0]
+
+### Added
+
+- Jev-as-a-Judge: four opt-in checks answered by TypeSafe's Jev, a decision model, through its
+  System One API:
+  `jev_relevance` (`relevance`'s 1 to 5 rubric as a score question: the score is the expected
+  level over 4 and `pass` is an expected level of 2 or more, a rating of 3), `jev_refusal`,
+  `jev_toxicity` and `jev_prompt_injection` (yes/no questions: `fail` when the probability of
+  "yes" is above 0.5, score `1 - p`). Each samples 10% of traces. The checks sampled for a span
+  go to Jev in one request, and each still emits its own event and `evaluate` span.
+  Explanations are templates (`score=3.6/5 confidence=0.82`, `p=0.93`): Jev writes no text.
+  They need `LLM_EVAL_JEV_JUDGE_MODEL` and `TYPESAFE_API_KEY`, and are experimental: thresholds are
+  initial values, not yet calibrated, and Jev's quality in Portuguese is still to be measured.
+  See [docs/jev-as-a-judge.md](docs/jev-as-a-judge.md).
+- The `jev_judge` lane, apart from the judge lane, with `LLM_EVAL_JEV_JUDGE_MAX_CONCURRENCY` (16),
+  `LLM_EVAL_JEV_JUDGE_QUEUE_MAX` (1000) and `LLM_EVAL_JEV_JUDGE_TOKENS_PER_MINUTE`: an unreachable OpenAI
+  judge doesn't drop Jev-as-a-Judge checks, and the other way around. A dropped request counts once per
+  check in `llm_eval.evaluations.dropped`.
+- Each Jev request is a `system_one {model}` span (`gen_ai.operation.name=system_one`,
+  `gen_ai.provider.name=typesafe`) under the first check's `evaluate` span, counted once in the
+  `gen_ai.client.*` metrics. New attributes: `llm_eval.judge.confidence`,
+  `llm_eval.judge.probability` and `llm_eval.judge.batch_size`.
+- `llm-eval-judge -e jev_*`, with `--dry-run` printing the masked state and the questions.
+- `tools/benchmark.py --against <evaluator>` compares two evaluators on the same items, by
+  language, and reports mean confidence; `tools/load_test.py --jev fake|slow|down`.
+- Labeled sets for refusal, toxicity and prompt injection in `tools/data/`, 50 items each in
+  Portuguese and English.
+- The fake judge server answers `POST /v1/systemone` and `GET /v1/models`, so the demo and
+  the end-to-end test run the Jev-as-a-Judge checks with no key;
+  `deploy/docker-compose.jev.yaml` runs the real Jev.
+
+### Changed
+
+- The `typesafe_sdk` logger is held at `WARNING`, even with `TYPESAFE_LOG_LEVEL=debug`: below
+  that, the SDK logs request and response bodies.
+- For evaluator authors: an evaluator can name its lane with a `lane` attribute (default: its
+  kind), and `BatchEvaluator`s with the same `batch_key` run as one job per interaction.
+- A new evaluation type, `jev_judge`, for the Jev-as-a-Judge checks: `llm_eval.evaluation.type`
+  tells them apart from the `llm_judge` OpenAI judge, and, like `llm_judge`, it names their
+  lane. Exempt services reach neither.
+- **Breaking:** the judge settings are named after the evaluation type. `LLM_EVAL_JUDGE_*` is
+  now `LLM_EVAL_LLM_JUDGE_*` (`LLM_EVAL_LLM_JUDGE_MODEL`, `_BASE_URL`, `_RESPONSE_FORMAT`,
+  `_TEMPERATURE`, `_REASONING_EFFORT`, `_MAX_OUTPUT_TOKENS`, `_MAX_CONCURRENCY`, `_QUEUE_MAX`,
+  `_TOKENS_PER_MINUTE`, `_EXPLANATION`), with no aliases: the old names are ignored, and
+  `relevance` fails to load without `LLM_EVAL_LLM_JUDGE_MODEL`. `LLM_EVAL_JUDGE_REDACT` keeps
+  its name, since it applies to every judge.
+
 ## [0.3.2]
 
 ### Added

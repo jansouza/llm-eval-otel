@@ -15,12 +15,15 @@ def test_defaults() -> None:
     assert s.association_exclude == ["correlation_id"]
     assert s.pii_types == ["cpf", "cnpj", "email", "credit_card", "phone", "pix_key"]
     assert not s.tls_enabled
-    assert s.judge_model is None and s.judge_base_url is None
-    assert s.judge_response_format == "json_schema"
-    assert s.judge_temperature is None and s.judge_reasoning_effort is None
-    assert (s.judge_max_concurrency, s.judge_queue_max) == (8, 1000)
-    assert s.judge_tokens_per_minute is None
-    assert s.judge_redact is True and s.judge_explanation is True
+    assert s.llm_judge_model is None and s.llm_judge_base_url is None
+    assert s.llm_judge_response_format == "json_schema"
+    assert s.llm_judge_temperature is None and s.llm_judge_reasoning_effort is None
+    assert (s.llm_judge_max_concurrency, s.llm_judge_queue_max) == (8, 1000)
+    assert s.llm_judge_tokens_per_minute is None
+    assert s.judge_redact is True and s.llm_judge_explanation is True
+    assert s.jev_judge_model is None and s.jev_judge_base_url is None
+    assert (s.jev_judge_max_concurrency, s.jev_judge_queue_max) == (16, 1000)
+    assert s.jev_judge_tokens_per_minute is None
     assert s.log_level == "INFO"
 
 
@@ -33,24 +36,36 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_parses_judge_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LLM_EVAL_JUDGE_MODEL", "gpt-5-mini-2025-08-07")
-    monkeypatch.setenv("LLM_EVAL_JUDGE_BASE_URL", "http://vllm:8000/v1")
-    monkeypatch.setenv("LLM_EVAL_JUDGE_RESPONSE_FORMAT", "json_object")
-    monkeypatch.setenv("LLM_EVAL_JUDGE_TEMPERATURE", "0")
-    monkeypatch.setenv("LLM_EVAL_JUDGE_TOKENS_PER_MINUTE", "200000")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_MODEL", "gpt-5-mini-2025-08-07")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_BASE_URL", "http://vllm:8000/v1")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT", "json_object")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_TEMPERATURE", "0")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_TOKENS_PER_MINUTE", "200000")
     monkeypatch.setenv("LLM_EVAL_JUDGE_REDACT", "false")
     s = Settings()
-    assert s.judge_model == "gpt-5-mini-2025-08-07"
-    assert s.judge_base_url == "http://vllm:8000/v1"
-    assert s.judge_response_format == "json_object"
-    assert s.judge_temperature == 0.0
-    assert s.judge_tokens_per_minute == 200_000
+    assert s.llm_judge_model == "gpt-5-mini-2025-08-07"
+    assert s.llm_judge_base_url == "http://vllm:8000/v1"
+    assert s.llm_judge_response_format == "json_object"
+    assert s.llm_judge_temperature == 0.0
+    assert s.llm_judge_tokens_per_minute == 200_000
     assert s.judge_redact is False
 
 
+def test_parses_jev_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_MODEL", "jev-1.13.0")
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_BASE_URL", "http://fake-judge:8080")
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_MAX_CONCURRENCY", "4")
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_QUEUE_MAX", "50")
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_TOKENS_PER_MINUTE", "1000000")
+    s = Settings()
+    assert (s.jev_judge_model, s.jev_judge_base_url) == ("jev-1.13.0", "http://fake-judge:8080")
+    assert (s.jev_judge_max_concurrency, s.jev_judge_queue_max) == (4, 50)
+    assert s.jev_judge_tokens_per_minute == 1_000_000
+
+
 def test_rejects_unknown_response_format(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LLM_EVAL_JUDGE_RESPONSE_FORMAT", "xml")
-    with pytest.raises(ValueError, match="judge_response_format"):
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT", "xml")
+    with pytest.raises(ValueError, match="llm_judge_response_format"):
         Settings()
 
 
@@ -146,6 +161,9 @@ def test_semconv_names_snapshot() -> None:
         "LLM_EVAL_CONTENT_TRUNCATED": "llm_eval.content.truncated",
         "LLM_EVAL_JUDGE_MODEL": "llm_eval.judge.model",
         "LLM_EVAL_JUDGE_RAW_SCORE": "llm_eval.judge.raw_score",
+        "LLM_EVAL_JUDGE_CONFIDENCE": "llm_eval.judge.confidence",
+        "LLM_EVAL_JUDGE_PROBABILITY": "llm_eval.judge.probability",
+        "LLM_EVAL_JUDGE_BATCH_SIZE": "llm_eval.judge.batch_size",
         "LLM_EVAL_SKIP_REASON": "llm_eval.skip.reason",
         "LLM_EVAL_DROP_REASON": "llm_eval.drop.reason",
         "LLM_EVAL_LANE": "llm_eval.lane",
@@ -172,6 +190,8 @@ def test_semconv_names_snapshot() -> None:
         "DROP_SHUTDOWN": "shutdown",
         "OPERATION_CHAT": "chat",
         "PROVIDER_OPENAI": "openai",
+        "OPERATION_SYSTEM_ONE": "system_one",
+        "PROVIDER_TYPESAFE": "typesafe",
         "GEN_AI_RESPONSE_MODEL": "gen_ai.response.model",
         "GEN_AI_USAGE_INPUT_TOKENS": "gen_ai.usage.input_tokens",
         "GEN_AI_USAGE_OUTPUT_TOKENS": "gen_ai.usage.output_tokens",

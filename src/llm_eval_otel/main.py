@@ -47,10 +47,11 @@ def log_startup(settings: Settings) -> None:
 
 def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    # The judge's SDK logs every retry, and its HTTP client (httpx2 since openai 3) every
-    # request, at INFO: a line per judge call. The summary and the failing/recovered lines
-    # already say how the judge is doing.
-    for noisy in ("openai", "httpx", "httpx2"):
+    # The judges' SDKs log every retry, and their HTTP client (httpx2) every request, at
+    # INFO: a line per judge call. The summary and the failing/recovered lines already say
+    # how the judges are doing. typesafe_sdk also logs request bodies at DEBUG; its adapter
+    # sets WARNING again once the client exists, since TYPESAFE_LOG_LEVEL applies on import.
+    for noisy in ("openai", "httpx", "httpx2", "typesafe_sdk"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     log.info("starting llm-eval-otel %s", __version__)
     apply_otel_defaults()

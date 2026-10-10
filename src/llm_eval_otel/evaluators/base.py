@@ -67,6 +67,11 @@ class EvaluatorKind(StrEnum):
     HEURISTIC = "heuristic"
     MODEL = "model"
     LLM_JUDGE = "llm_judge"
+    JEV_JUDGE = "jev_judge"
+
+
+# Kinds that send content to an external judge: an exempt service never reaches them.
+JUDGE_KINDS = frozenset({EvaluatorKind.LLM_JUDGE, EvaluatorKind.JEV_JUDGE})
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,27 @@ class Evaluator(Protocol):
     def applies_to(self, interaction: GenAIInteraction) -> bool: ...
 
     async def evaluate(self, interaction: GenAIInteraction) -> EvaluationResult: ...
+
+    # Optional, read with getattr: ``lane: str``, the execution lane the evaluator runs in
+    # (default: its kind). An evaluator naming a lane the service doesn't have runs inline.
+
+
+@runtime_checkable
+class BatchEvaluator(Evaluator, Protocol):
+    """Evaluators that can share one call with others of the same ``batch_key``.
+
+    The runner gathers the ones chosen for an interaction (sampled, not exempt, same
+    ``max_chars``) into one job and calls :meth:`evaluate_batch` on the first one's class.
+    """
+
+    batch_key: str
+
+    @classmethod
+    async def evaluate_batch(
+        cls, evaluators: Sequence["BatchEvaluator"], interaction: GenAIInteraction
+    ) -> list[EvaluationResult]:
+        """One result per evaluator, in order."""
+        ...
 
 
 # Where a finding appeared, used in explanations.

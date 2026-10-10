@@ -1,7 +1,8 @@
 # Demo: synthetic app -> Collector -> llm-eval-otel -> Collector -> Grafana LGTM.
 #   docker compose -f deploy/docker-compose.yaml up --build
 # Grafana: http://localhost:3000 (Tempo for traces, Loki for events, Prometheus for metrics)
-# The relevance judge is a deterministic fake (tools/fake_judge_server.py): no API key.
+# The relevance judge and the Jev checks answer from a deterministic fake
+# (tools/fake_judge_server.py): no API key. For the real Jev, add docker-compose.jev.yaml.
 name: llm-eval-otel
 
 services:
@@ -36,15 +37,20 @@ services:
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4319
       OTEL_METRIC_EXPORT_INTERVAL: "5000"
-      LLM_EVAL_EVALUATORS: pii_detection,secret_detection,refusal,system_prompt_leak,output_format,relevance
-      LLM_EVAL_EXCEPTIONS: '{"bank-chatbot": ["pii_detection", "relevance"]}'
-      # The demo judges every span; in production relevance samples 5% of traces.
-      LLM_EVAL_SAMPLE_RATES: relevance=1.0
+      LLM_EVAL_EVALUATORS: pii_detection,secret_detection,refusal,system_prompt_leak,output_format,relevance,jev_relevance,jev_refusal,jev_toxicity,jev_prompt_injection
+      LLM_EVAL_EXCEPTIONS: '{"bank-chatbot": ["pii_detection", "relevance", "jev_relevance"]}'
+      # The demo judges every span; in production relevance samples 5% of traces and each
+      # jev_* check 10%.
+      LLM_EVAL_SAMPLE_RATES: relevance=1.0,jev_relevance=1.0,jev_refusal=1.0,jev_toxicity=1.0,jev_prompt_injection=1.0
       # To use the OpenAI API instead, drop the base URL and set a real model and key, e.g.
-      # LLM_EVAL_JUDGE_MODEL: gpt-5-mini-2025-08-07 and OPENAI_API_KEY from a secret.
-      LLM_EVAL_JUDGE_MODEL: fake-judge-1
-      LLM_EVAL_JUDGE_BASE_URL: http://fake-judge:8080/v1
+      # LLM_EVAL_LLM_JUDGE_MODEL: gpt-5-mini-2025-08-07 and OPENAI_API_KEY from a secret.
+      LLM_EVAL_LLM_JUDGE_MODEL: fake-judge-1
+      LLM_EVAL_LLM_JUDGE_BASE_URL: http://fake-judge:8080/v1
       OPENAI_API_KEY: unused-by-the-fake-judge
+      # The same fake answers TypeSafe's System One API (the SDK adds /v1/systemone).
+      LLM_EVAL_JEV_JUDGE_MODEL: jev-1.13.0
+      LLM_EVAL_JEV_JUDGE_BASE_URL: http://fake-judge:8080
+      TYPESAFE_API_KEY: unused-by-the-fake-judge
     depends_on:
       otel-collector: { condition: service_started }
       fake-judge: { condition: service_healthy }

@@ -1,7 +1,7 @@
 """The ``openai`` judge adapter: the official SDK over the Chat Completions API.
 
 Chat Completions is the API OpenAI-compatible servers implement, so the same code talks to
-the OpenAI API (``LLM_EVAL_JUDGE_BASE_URL`` unset) and to a judge the adopter hosts (vLLM,
+the OpenAI API (``LLM_EVAL_LLM_JUDGE_BASE_URL`` unset) and to a judge the adopter hosts (vLLM,
 Ollama, or a gateway such as LiteLLM in front of other providers).
 
 No instrumentation library wraps the SDK: they can record message content when an
@@ -88,15 +88,15 @@ class OpenAIJudge:
     def from_settings(
         cls, settings: Settings, *, evaluator: str, timeout_s: float
     ) -> "OpenAIJudge":
-        if not settings.judge_model:
-            raise JudgeConfigError(f"{evaluator} needs LLM_EVAL_JUDGE_MODEL")
+        if not settings.llm_judge_model:
+            raise JudgeConfigError(f"{evaluator} needs LLM_EVAL_LLM_JUDGE_MODEL")
         return cls(
-            model=settings.judge_model,
-            base_url=settings.judge_base_url,
-            response_format=settings.judge_response_format,
-            temperature=settings.judge_temperature,
-            reasoning_effort=settings.judge_reasoning_effort,
-            max_output_tokens=settings.judge_max_output_tokens,
+            model=settings.llm_judge_model,
+            base_url=settings.llm_judge_base_url,
+            response_format=settings.llm_judge_response_format,
+            temperature=settings.llm_judge_temperature,
+            reasoning_effort=settings.llm_judge_reasoning_effort,
+            max_output_tokens=settings.llm_judge_max_output_tokens,
             timeout_s=timeout_s,
         )
 

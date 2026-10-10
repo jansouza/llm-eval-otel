@@ -8,9 +8,13 @@
 3. With ``--judge slow`` or ``--judge down``, ``relevance`` is on too, against the fake
    judge server answering after ``--judge-delay`` seconds, or against a closed port. The
    heuristics' throughput should match the run without a judge: the judge has its own lane.
+4. With ``--jev fake``, ``slow`` or ``down``, the four ``jev_*`` checks are on too, against the
+   fake server's System One API (at once, or after ``--jev-delay`` seconds) or a closed port.
+   They have their own lane: ``--judge down --jev fake`` should drop no Jev check.
 
     uv run python tools/load_test.py --spans 5000 --text-kb 10
     uv run python tools/load_test.py --spans 3000 --judge slow --judge-delay 5
+    uv run python tools/load_test.py --spans 3000 --judge down --jev fake --skip-latency
 """
 
 import argparse
@@ -26,6 +30,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -141,16 +147,25 @@ def evaluator_latency(text_kb: int, runs: int) -> dict[str, tuple[float, float]]
 
 
 HEURISTICS = frozenset({"pii_detection", "secret_detection"})
+JEV_CHECKS = ("jev_relevance", "jev_refusal", "jev_toxicity", "jev_prompt_injection")
 
 
 class FakeCollector(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int]) -> None:
         super().__init__(address, Handler)
         self.events = 0  # heuristic evaluation events
-        self.judge_events = 0
-        self.judge_errors = 0
-        self.dropped: dict[str, int] = {}  # latest llm_eval.evaluations.dropped, by reason
+        self.judge_events: Counter[str] = Counter()  # judge evaluation events, by name
+        self.judge_errors: Counter[str] = Counter()
+        # latest llm_eval.evaluations.dropped, by (evaluation name, reason)
+        self.dropped: dict[tuple[str, str], int] = {}
         self.lock = threading.Lock()
+
+    def drops(self, names: Iterable[str]) -> dict[str, int]:
+        by_reason: Counter[str] = Counter()
+        for (name, reason), n in self.dropped.items():
+            if name in names:
+                by_reason[reason] += n
+        return dict(by_reason)
 
 
 def attribute(record: Any, key: str) -> str:
@@ -173,13 +188,13 @@ class Handler(BaseHTTPRequestHandler):
             ]
             names = [attribute(r, "gen_ai.evaluation.name") for r in records]
             with self.server.lock:
-                self.server.events += sum(1 for name in names if name in HEURISTICS)
-                self.server.judge_events += names.count("relevance")
-                self.server.judge_errors += sum(
-                    1
-                    for r, name in zip(records, names, strict=True)
-                    if name == "relevance" and attribute(r, "error.type")
-                )
+                for record, name in zip(records, names, strict=True):
+                    if name in HEURISTICS:
+                        self.server.events += 1
+                        continue
+                    self.server.judge_events[name] += 1
+                    if attribute(record, "error.type"):
+                        self.server.judge_errors[name] += 1
         elif self.path == "/v1/metrics":
             metrics = ExportMetricsServiceRequest.FromString(body)
             for rm in metrics.resource_metrics:
@@ -189,8 +204,9 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         with self.server.lock:
                             for point in metric.sum.data_points:
+                                name = attribute(point, "gen_ai.evaluation.name")
                                 reason = attribute(point, "llm_eval.drop.reason")
-                                self.server.dropped[reason] = point.as_int
+                                self.server.dropped[name, reason] = point.as_int
         self.send_response(200)
         self.send_header("content-type", "application/x-protobuf")
         self.end_headers()
@@ -256,25 +272,54 @@ def wait_ready(url: str, timeout_s: float = 30) -> None:
     raise RuntimeError("service did not become ready")
 
 
+DOWN = "http://127.0.0.1:9"  # nothing listens there: every call fails fast
+
+
+def fake_server(mode: str, delay_s: float) -> FakeJudgeServer | None:
+    if mode not in ("fake", "slow"):
+        return None
+    server = FakeJudgeServer(("127.0.0.1", 0), delay_s=delay_s if mode == "slow" else 0.0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
 def judge_env(
-    mode: str, delay_s: float, rate: float
-) -> tuple[dict[str, str], FakeJudgeServer | None]:
-    if mode == "none":
-        return {}, None
-    server = None
-    base_url = "http://127.0.0.1:9/v1"  # nothing listens there: every call fails fast
-    if mode == "slow":
-        server = FakeJudgeServer(("127.0.0.1", 0), delay_s=delay_s)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        base_url = server.base_url
-    env = {
-        "LLM_EVAL_EVALUATORS": "pii_detection,secret_detection,relevance",
-        "LLM_EVAL_SAMPLE_RATES": f"relevance={rate}",
-        "LLM_EVAL_JUDGE_MODEL": "fake-judge-1",
-        "LLM_EVAL_JUDGE_BASE_URL": base_url,
-        "OPENAI_API_KEY": "unused",
-    }
-    return env, server
+    judge: str,
+    judge_delay_s: float,
+    judge_rate: float,
+    jev: str,
+    jev_delay_s: float,
+    jev_rate: float,
+) -> tuple[dict[str, str], list[FakeJudgeServer]]:
+    """The judges' settings, and the fake servers started for them."""
+    evaluators = ["pii_detection", "secret_detection"]
+    rates: dict[str, float] = {}
+    env: dict[str, str] = {}
+    servers = []
+    if judge != "none":
+        server = fake_server(judge, judge_delay_s)
+        servers += [server] if server else []
+        evaluators.append("relevance")
+        rates["relevance"] = judge_rate
+        env |= {
+            "LLM_EVAL_LLM_JUDGE_MODEL": "fake-judge-1",
+            "LLM_EVAL_LLM_JUDGE_BASE_URL": server.base_url if server else f"{DOWN}/v1",
+            "OPENAI_API_KEY": "unused",
+        }
+    if jev != "none":
+        server = fake_server(jev, jev_delay_s)
+        servers += [server] if server else []
+        evaluators += JEV_CHECKS
+        rates |= dict.fromkeys(JEV_CHECKS, jev_rate)
+        env |= {
+            "LLM_EVAL_JEV_JUDGE_MODEL": "jev-1.13.0",
+            "LLM_EVAL_JEV_JUDGE_BASE_URL": server.root_url if server else DOWN,
+            "TYPESAFE_API_KEY": "unused",
+        }
+    if rates:
+        env["LLM_EVAL_EVALUATORS"] = ",".join(evaluators)
+        env["LLM_EVAL_SAMPLE_RATES"] = ",".join(f"{k}={v}" for k, v in rates.items())
+    return env, servers
 
 
 def throughput(
@@ -336,6 +381,9 @@ def main() -> None:
     parser.add_argument("--judge", choices=["none", "slow", "down"], default="none")
     parser.add_argument("--judge-delay", type=float, default=5.0, help="seconds per judge call")
     parser.add_argument("--judge-rate", type=float, default=0.05, help="relevance sample rate")
+    parser.add_argument("--jev", choices=["none", "fake", "slow", "down"], default="none")
+    parser.add_argument("--jev-delay", type=float, default=0.5, help="seconds per Jev call")
+    parser.add_argument("--jev-rate", type=float, default=0.1, help="each jev_* check's rate")
     parser.add_argument("--skip-latency", action="store_true")
     args = parser.parse_args()
 
@@ -344,14 +392,16 @@ def main() -> None:
         for name, (p50, p99) in evaluator_latency(args.text_kb, args.latency_runs).items():
             print(f"  {name:18s} p50 {p50:6.2f} ms   p99 {p99:6.2f} ms")
 
-    judge, judge_server = judge_env(args.judge, args.judge_delay, args.judge_rate)
+    judge, servers = judge_env(
+        args.judge, args.judge_delay, args.judge_rate, args.jev, args.jev_delay, args.jev_rate
+    )
     try:
         rate, retries, collector = throughput(
             args.spans, args.batch, args.text_kb, args.workers, judge
         )
     finally:
-        if judge_server is not None:
-            judge_server.shutdown()
+        for server in servers:
+            server.shutdown()
     print(
         f"Throughput: {rate:.0f} spans/s per process "
         f"({args.spans} spans, {args.text_kb} KB each, batches of {args.batch}, "
@@ -361,8 +411,17 @@ def main() -> None:
         delay = f", {args.judge_delay:g} s per call" if args.judge == "slow" else ""
         print(
             f"Judge {args.judge}{delay}, relevance at {args.judge_rate:g}: "
-            f"{collector.judge_events} events ({collector.judge_errors} with error.type), "
-            f"dropped {dict(collector.dropped) or 0}"
+            f"{collector.judge_events['relevance']} events "
+            f"({collector.judge_errors['relevance']} with error.type), "
+            f"dropped {collector.drops(['relevance']) or 0}"
+        )
+    if args.jev != "none":
+        delay = f", {args.jev_delay:g} s per call" if args.jev == "slow" else ""
+        events = sum(collector.judge_events[name] for name in JEV_CHECKS)
+        errors = sum(collector.judge_errors[name] for name in JEV_CHECKS)
+        print(
+            f"Jev {args.jev}{delay}, each check at {args.jev_rate:g}: {events} events "
+            f"({errors} with error.type), dropped {collector.drops(JEV_CHECKS) or 0}"
         )
 
 

@@ -309,7 +309,7 @@
         <tr><td><code>system_prompt_leak</code></td><td><span class="pill opt">opt-in</span></td><td>Respostas que copiam trechos das instruções de sistema (sobreposição de 8-gramas)</td></tr>
         <tr><td><code>output_format</code></td><td><span class="pill opt">opt-in</span></td><td>JSON inválido quando o cliente pediu JSON</td></tr>
         <tr><td><code>relevance</code></td><td><span class="pill opt">opt-in</span></td><td>Respostas fora do assunto, nota de 1 a 5 de um juiz LLM (OpenAI ou servidor compatível), em 5% dos traces</td></tr>
-        <tr><td><code>jev_relevance</code>, <code>jev_refusal</code>, <code>jev_toxicity</code>, <code>jev_prompt_injection</code></td><td><span class="pill exp">experimental</span></td><td>Relevância, recusa, toxicidade e prompt injection respondidos pelo Jev da TypeSafe, numa só requisição por span, em 10% dos traces</td></tr>
+        <tr><td><code>jev_relevance</code>, <code>jev_refusal</code>, <code>jev_toxicity</code>, <code>jev_prompt_injection</code></td><td><span class="pill exp">experimental</span></td><td>Jev-as-a-Judge: relevância, recusa, toxicidade e prompt injection respondidos pelo Jev da TypeSafe, numa só requisição por span, em 10% dos traces</td></tr>
       </tbody>
     </table>
     </div>
@@ -360,15 +360,15 @@ llm_eval.evaluation.type       heuristic</code></pre>
 <!-- 8 -->
 <section class="slide" id="juizes">
   <div class="inner">
-    <p class="eyebrow">LLM-as-a-Judge e Jev</p>
+    <p class="eyebrow">LLM-as-a-Judge e Jev-as-a-Judge</p>
     <h2>Juízes por amostragem, em filas separadas</h2>
     <div class="grid g2">
       <div class="card">
-        <h3><code>relevance</code></h3>
-        <p>SDK da OpenAI sobre Chat Completions. <code>LLM_EVAL_JUDGE_BASE_URL</code> aponta para qualquer servidor compatível (vLLM, Ollama, LiteLLM). Saída em JSON schema estrito por padrão, sempre validada. Nota de 1 a 5; passa com 3 ou mais. Roda em 5% dos traces.</p>
+        <h3>LLM-as-a-Judge: <code>relevance</code></h3>
+        <p>SDK da OpenAI sobre Chat Completions. <code>LLM_EVAL_LLM_JUDGE_BASE_URL</code> aponta para qualquer servidor compatível (vLLM, Ollama, LiteLLM). Saída em JSON schema estrito por padrão, sempre validada. Nota de 1 a 5; passa com 3 ou mais. Roda em 5% dos traces.</p>
       </div>
       <div class="card">
-        <h3><code>jev_*</code></h3>
+        <h3>Jev-as-a-Judge: <code>jev_*</code></h3>
         <p>O Jev é um modelo de decisão da TypeSafe: lê um estado e responde perguntas tipadas com probabilidade ou nota esperada. As quatro checagens sorteadas para um span vão juntas numa requisição. Roda em 10% dos traces.</p>
       </div>
     </div>
@@ -449,7 +449,7 @@ llm_eval.evaluation.type       heuristic</code></pre>
         <p>O registro é por entry point, no <code>pyproject.toml</code> do seu pacote:</p>
 <pre><code>[project.entry-points."llm_eval.evaluators"]
 conciseness = "my_package.conciseness:Conciseness"</code></pre>
-        <p class="muted small" style="margin-top:14px">Um juiz pode herdar de <code>JudgeEvaluator</code> e ganha mascaramento, envelope da conversa, spans e métricas de chamada. Uma checagem Jev herda de <code>NoulCheck</code> ou <code>ScoreCheck</code>.</p>
+        <p class="muted small" style="margin-top:14px">Um juiz pode herdar de <code>JudgeEvaluator</code> e ganha mascaramento, envelope da conversa, spans e métricas de chamada. Uma checagem Jev-as-a-Judge herda de <code>NoulCheck</code> ou <code>ScoreCheck</code>.</p>
       </div>
     </div>
   </div>
@@ -479,8 +479,8 @@ conciseness = "my_package.conciseness:Conciseness"</code></pre>
     <div class="grid g3">
       <a class="card" href="https://github.com/jansouza/llm-eval-otel#readme" style="text-decoration:none"><h3>README</h3><p>Visão geral, quick start, configuração mais usada</p></a>
       <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/evaluators.md" style="text-decoration:none"><h3>Avaliadores</h3><p>O que cada um lê, como interpretar, como escrever o seu</p></a>
-      <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/judge.md" style="text-decoration:none"><h3>LLM-as-a-Judge</h3><p><code>relevance</code>, o que vai ao provedor, CLI, calibração</p></a>
-      <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/jev.md" style="text-decoration:none"><h3>Jev</h3><p>As checagens <code>jev_*</code>, custo, rate limits</p></a>
+      <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/llm-as-a-judge.md" style="text-decoration:none"><h3>LLM-as-a-Judge</h3><p><code>relevance</code>, o que vai ao provedor, CLI, calibração</p></a>
+      <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/jev-as-a-judge.md" style="text-decoration:none"><h3>Jev-as-a-Judge</h3><p>As checagens <code>jev_*</code>, custo, rate limits</p></a>
       <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/configuration.md" style="text-decoration:none"><h3>Configuração</h3><p>Todas as variáveis, exceções, amostragem, auth e TLS</p></a>
       <a class="card" href="https://github.com/jansouza/llm-eval-otel/blob/main/docs/telemetry.md" style="text-decoration:none"><h3>Telemetria</h3><p>Atributos de evento e span, spans do juiz, métricas</p></a>
     </div>

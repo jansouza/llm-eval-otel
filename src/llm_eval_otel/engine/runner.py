@@ -10,6 +10,8 @@ from typing import Protocol
 
 from llm_eval_otel import semconv
 from llm_eval_otel.evaluators.base import (
+    JUDGE_KINDS,
+    BatchEvaluator,
     EvaluationResult,
     Evaluator,
     EvaluatorKind,
@@ -42,16 +44,33 @@ class EvaluationRecord:
 
 @dataclass(frozen=True)
 class Job:
-    """An evaluator chosen for an interaction: sampled, not exempt, input already cut."""
+    """Evaluators chosen for an interaction: sampled, not exempt, input already cut.
 
-    evaluator: Evaluator
-    interaction: GenAIInteraction  # as extracted; the record and the event refer to it
-    evaluator_input: GenAIInteraction  # cut to the evaluator's max_chars
+    One evaluator, or a batch of :class:`BatchEvaluator` with the same ``batch_key`` and
+    ``max_chars`` that one call answers.
+    """
+
+    evaluators: tuple[Evaluator, ...]
+    interaction: GenAIInteraction  # as extracted; the records and the events refer to it
+    evaluator_input: GenAIInteraction  # cut to the evaluators' max_chars
     truncated: bool
 
 
 class JobLane(Protocol):
     def offer(self, job: Job) -> bool: ...
+
+
+def lane_of(evaluator: Evaluator) -> str:
+    """The lane an evaluator asks for (``lane``), or its kind."""
+    lane = getattr(evaluator, "lane", None)
+    return lane if isinstance(lane, str) else str(evaluator.kind)
+
+
+def batch_key(evaluator: Evaluator) -> tuple[str, int | None] | None:
+    """Evaluators with the same key, chosen for the same interaction, share one job."""
+    if isinstance(evaluator, BatchEvaluator):
+        return evaluator.batch_key, evaluator.max_chars
+    return None
 
 
 def ref(interaction: GenAIInteraction) -> str:
@@ -60,6 +79,11 @@ def ref(interaction: GenAIInteraction) -> str:
         f"trace={interaction.trace_id.hex()} span={interaction.span_id.hex()} "
         f"service={interaction.service_name}"
     )
+
+
+def job_name(job: Job) -> str:
+    """How log lines name a job: its evaluators, ``+``-joined for a batch."""
+    return "+".join(e.name for e in job.evaluators)
 
 
 def sampled(trace_id: bytes, rate: float) -> bool:
@@ -120,7 +144,11 @@ def exempt(result: EvaluationResult) -> EvaluationResult:
 
 
 def log_result(
-    name: str, job: Job, result: EvaluationResult, duration_ms: float, calls: list[JudgeCall]
+    name: str,
+    job: Job,
+    result: EvaluationResult,
+    duration_ms: float,
+    calls: Sequence[JudgeCall],
 ) -> None:
     """DEBUG: label, score and timings; never the explanation, which may be a judge's own words.
 
@@ -166,11 +194,11 @@ class Runner:
         self.exceptions = {
             service: frozenset(names) for service, names in (exceptions or {}).items()
         }
-        # Kinds that run in their own lane instead of holding the queue worker.
-        self.lanes: dict[EvaluatorKind, JobLane] = {}
+        # Lanes, by name, that run their jobs apart instead of holding the queue worker.
+        self.lanes: dict[str, JobLane] = {}
 
-    def add_lane(self, kind: EvaluatorKind, lane: JobLane) -> None:
-        self.lanes[kind] = lane
+    def add_lane(self, name: str, lane: JobLane) -> None:
+        self.lanes[name] = lane
 
     def sample_rate(self, evaluator: Evaluator) -> float:
         return self.sample_rates.get(evaluator.name, evaluator.sample_rate)
@@ -191,32 +219,48 @@ class Runner:
         ]
 
     def prepare(self, evaluator: Evaluator, interaction: GenAIInteraction) -> Job:
-        if evaluator.max_chars is None:
-            return Job(evaluator, interaction, interaction, truncated=False)
-        evaluator_input, truncated = truncate(interaction, evaluator.max_chars)
-        return Job(evaluator, interaction, evaluator_input, truncated)
+        return self.prepare_batch([evaluator], interaction)
+
+    def prepare_batch(self, evaluators: Sequence[Evaluator], interaction: GenAIInteraction) -> Job:
+        """A batch shares one max_chars (part of its key), so one cut input serves all."""
+        max_chars = evaluators[0].max_chars
+        if max_chars is None:
+            return Job(tuple(evaluators), interaction, interaction, truncated=False)
+        evaluator_input, truncated = truncate(interaction, max_chars)
+        return Job(tuple(evaluators), interaction, evaluator_input, truncated)
 
     async def run(self, interaction: GenAIInteraction) -> list[EvaluationRecord]:
         """Records of the evaluators run here; lane jobs are emitted by their lane."""
         records = []
-        inline = []
+        jobs = []
+        batches: dict[tuple[str, int | None], list[Evaluator]] = {}
         for evaluator in self.select(interaction):
-            if evaluator.kind == EvaluatorKind.LLM_JUDGE and self.is_exempt(evaluator, interaction):
+            if evaluator.kind in JUDGE_KINDS and self.is_exempt(evaluator, interaction):
                 # Running a judge for an exempt service would pay to send content out.
                 log.debug(
                     "%s %s: exempt service, judge not called", evaluator.name, ref(interaction)
                 )
                 records.append(self._exempt_without_call(evaluator, interaction))
                 continue
-            job = self.prepare(evaluator, interaction)
-            lane = self.lanes.get(evaluator.kind)
+            key = batch_key(evaluator)
+            if key is None:
+                jobs.append(self.prepare(evaluator, interaction))
+            else:
+                batches.setdefault(key, []).append(evaluator)
+        jobs += [self.prepare_batch(batch, interaction) for batch in batches.values()]
+
+        inline = []
+        for job in jobs:
+            lane_name = lane_of(job.evaluators[0])
+            lane = self.lanes.get(lane_name)
             if lane is None:
                 inline.append(job)
             elif lane.offer(job):  # a full lane drops and counts it; the heuristics go on
                 log.debug(
-                    "%s %s: queued in the %s lane", evaluator.name, ref(interaction), evaluator.kind
+                    "%s %s: queued in the %s lane", job_name(job), ref(interaction), lane_name
                 )
-        records += await asyncio.gather(*(self.execute(job) for job in inline))
+        for job_records in await asyncio.gather(*(self.execute(job) for job in inline)):
+            records += job_records
         return records
 
     def _exempt_without_call(
@@ -232,34 +276,62 @@ class Runner:
             end_ns=now,
         )
 
-    async def execute(self, job: Job) -> EvaluationRecord:
-        evaluator = job.evaluator
+    async def _evaluate(self, job: Job) -> list[EvaluationResult]:
+        evaluators = job.evaluators
+        first = evaluators[0]
+        if len(evaluators) > 1:
+            assert isinstance(first, BatchEvaluator)  # only those are batched
+            batch = [e for e in evaluators if isinstance(e, BatchEvaluator)]
+            timeout = max(self.timeout(e) for e in evaluators)
+            results = await asyncio.wait_for(
+                type(first).evaluate_batch(batch, job.evaluator_input), timeout=timeout
+            )
+            if len(results) != len(evaluators):
+                raise ValueError("evaluate_batch must return one result per evaluator")
+            return results
+        if first.kind == EvaluatorKind.HEURISTIC:
+            # CPU-bound: keep the event loop free so ingestion and 429s keep answering.
+            call = asyncio.to_thread(_run_in_thread, first, job.evaluator_input)
+        else:
+            call = first.evaluate(job.evaluator_input)
+        return [await asyncio.wait_for(call, timeout=self.timeout(first))]
+
+    async def execute(self, job: Job) -> list[EvaluationRecord]:
+        """One record per evaluator in the job.
+
+        A batch makes one call, so its judge calls go on the first record only: the call's
+        span and client metrics appear once per request.
+        """
         start_ns = time.time_ns()
         with recording() as judge_calls:
             try:
-                if evaluator.kind == EvaluatorKind.HEURISTIC:
-                    # CPU-bound: keep the event loop free so ingestion and 429s keep answering.
-                    call = asyncio.to_thread(_run_in_thread, evaluator, job.evaluator_input)
-                else:
-                    call = evaluator.evaluate(job.evaluator_input)
-                result = await asyncio.wait_for(call, timeout=self.timeout(evaluator))
+                results = await self._evaluate(job)
             except TimeoutError:
-                result = EvaluationResult(None, None, None, error_type=ERROR_TIMEOUT)
+                results = [EvaluationResult(None, None, None, error_type=ERROR_TIMEOUT)] * len(
+                    job.evaluators
+                )
             except Exception as exc:  # an evaluator failure must not stop the others
                 # Class name only: exception messages may quote evaluated content.
-                result = EvaluationResult(None, None, None, error_type=type(exc).__name__)
+                error = EvaluationResult(None, None, None, error_type=type(exc).__name__)
+                results = [error] * len(job.evaluators)
         end_ns = time.time_ns()
 
-        if result.error_type is None and self.is_exempt(evaluator, job.interaction):
-            result = exempt(result)
-        log_result(evaluator.name, job, result, (end_ns - start_ns) / 1e6, judge_calls)
-        return EvaluationRecord(
-            interaction=job.interaction,
-            evaluator_name=evaluator.name,
-            evaluator_kind=str(evaluator.kind),
-            result=result,
-            start_ns=start_ns,
-            end_ns=end_ns,
-            truncated=job.truncated,
-            judge_calls=tuple(judge_calls),
-        )
+        records = []
+        for n, (evaluator, result) in enumerate(zip(job.evaluators, results, strict=True)):
+            if result.error_type is None and self.is_exempt(evaluator, job.interaction):
+                result = exempt(result)
+            calls = tuple(judge_calls) if n == 0 else ()
+            log_result(evaluator.name, job, result, (end_ns - start_ns) / 1e6, calls)
+            records.append(
+                EvaluationRecord(
+                    interaction=job.interaction,
+                    evaluator_name=evaluator.name,
+                    evaluator_kind=str(evaluator.kind),
+                    result=result,
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    truncated=job.truncated,
+                    judge_calls=calls,
+                )
+            )
+        return records
