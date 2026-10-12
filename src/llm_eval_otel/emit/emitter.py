@@ -1,8 +1,10 @@
 """Turn evaluation records into an event, an optional child span and metrics.
 
-For judge evaluators, each call to the judge also becomes a ``chat {model}`` span under the
+For judge evaluators, each call to the judge also becomes a ``{operation} {model}`` span
+(``chat`` for the OpenAI-compatible judge, ``system_one`` for Jev) under the
 ``evaluate {name}`` span, plus the GenAI client metrics. Those carry model, endpoint,
-tokens and finish reason, never content.
+tokens and finish reason, never content. A Jev batch is one call: it hangs under the first
+check's ``evaluate`` span.
 """
 
 from collections.abc import Collection, Iterable
@@ -84,7 +86,7 @@ def event_attributes(record: EvaluationRecord) -> dict[str, AttributeValue]:
 def judge_call_attributes(call: JudgeCall) -> dict[str, AttributeValue]:
     """GenAI client span attributes, without gen_ai.input/output.messages: no content."""
     attrs: dict[str, AttributeValue] = {
-        semconv.GEN_AI_OPERATION_NAME: semconv.OPERATION_CHAT,
+        semconv.GEN_AI_OPERATION_NAME: call.operation_name,
         semconv.GEN_AI_PROVIDER_NAME: call.provider_name,
         semconv.GEN_AI_REQUEST_MODEL: call.request_model,
     }
@@ -236,7 +238,7 @@ class Emitter:
         attrs, _ = sanitize(judge_call_attributes(call))
         if ctx is not None:
             span = self.tracer.start_span(
-                f"{semconv.OPERATION_CHAT} {call.request_model}",
+                f"{call.operation_name} {call.request_model}",
                 context=ctx,
                 kind=SpanKind.CLIENT,
                 attributes=attrs,

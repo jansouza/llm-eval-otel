@@ -1,4 +1,4 @@
-# Plano — avaliadores v0.3
+# Plano — LLM-as-a-Judge
 
 30/09/2026 · Jan Souza
 
@@ -19,7 +19,7 @@ Resultado esperado:
 - Nenhum dado sensível detectável sai do serviço para o provedor do juiz, e há um caminho para quem não pode mandar conteúdo para fora: um juiz hospedado pelo próprio adotante.
 - As heurísticas continuam em 100% dos spans e com a vazão da v0.2, mesmo com o provedor do juiz lento ou fora do ar.
 
-A v0.3 depende das partes de mensagem da [v0.2](eval-v0-2-plan.md). As faixas de execução nascem aqui e são reaproveitadas pelos classificadores locais da [v0.4](eval-v0-4-plan.md).
+A v0.3 depende das partes de mensagem da [v0.2](eval-heuristics-plan.md). As faixas de execução nascem aqui e são reaproveitadas pelos classificadores locais da [v0.4](eval-local-classifiers-plan.md).
 
 ## O que muda em relação à v0.2
 
@@ -44,15 +44,15 @@ flowchart LR
     r -- "heurísticas<br/>asyncio.to_thread" --> s["emit"]
     r -- "kind = llm_judge<br/>oferece sem esperar" --> l["faixa llm_judge<br/>fila limitada"]
     l -- "cheia ou sem orçamento" --> d["descarta e conta<br/>llm_eval.evaluations.dropped"]
-    l --> p["event loop<br/>semáforo LLM_EVAL_JUDGE_MAX_CONCURRENCY"] --> s
+    l --> p["event loop<br/>semáforo LLM_EVAL_LLM_JUDGE_MAX_CONCURRENCY"] --> s
 ```
 
 Regras:
 
 - Amostragem, exceção por serviço e corte por `max_chars` acontecem antes de oferecer a interação à faixa, no mesmo código que já existe em `Runner._run_one`.
 - Faixa cheia descarta a avaliação e conta em `llm_eval.evaluations.dropped`. Ela não gera 429: a fila principal é que controla a contrapressão do Collector, e as heurísticas precisam continuar vendo tudo. Sob sobrecarga, o juiz passa a avaliar uma amostra menor, e a métrica mostra o tamanho da perda.
-- Sem pool de threads: o juiz espera I/O e roda no event loop, com concorrência limitada por semáforo (`LLM_EVAL_JUDGE_MAX_CONCURRENCY`). O timeout usa `asyncio.wait_for`, que cancela a chamada HTTP de fato. O evento sai com `error.type=timeout`, como hoje.
-- **Orçamento de tokens.** `LLM_EVAL_JUDGE_TOKENS_PER_MINUTE` alimenta um balde de tokens. Antes da chamada, o serviço reserva uma estimativa (caracteres / 4 mais o máximo de saída) e, depois, acerta pelo uso real. Se o servidor não informar o uso, fica a estimativa. Sem saldo, a avaliação é descartada com `llm_eval.drop.reason=budget`. Isso limita o custo mesmo quando o tráfego sobe ou uma conversa é enorme.
+- Sem pool de threads: o juiz espera I/O e roda no event loop, com concorrência limitada por semáforo (`LLM_EVAL_LLM_JUDGE_MAX_CONCURRENCY`). O timeout usa `asyncio.wait_for`, que cancela a chamada HTTP de fato. O evento sai com `error.type=timeout`, como hoje.
+- **Orçamento de tokens.** `LLM_EVAL_LLM_JUDGE_TOKENS_PER_MINUTE` alimenta um balde de tokens. Antes da chamada, o serviço reserva uma estimativa (caracteres / 4 mais o máximo de saída) e, depois, acerta pelo uso real. Se o servidor não informar o uso, fica a estimativa. Sem saldo, a avaliação é descartada com `llm_eval.drop.reason=budget`. Isso limita o custo mesmo quando o tráfego sobe ou uma conversa é enorme.
 - Provedor fora do ar vira `error.type` nos eventos das avaliações amostradas, e a faixa não segura a fila principal.
 - No SIGTERM, o serviço drena a fila principal e depois as faixas, dentro dos mesmos 30 s. O que sobra conta em `llm_eval.evaluations.dropped` com o motivo `shutdown`.
 - `/readyz` continua olhando só a fila principal.
@@ -83,14 +83,14 @@ class JudgeClient(Protocol):
     async def judge(self, system: str, content: str, schema: Mapping[str, Any]) -> JudgeResponse: ...
 ```
 
-- **Um adaptador, `openai`.** SDK oficial (`openai`, cliente `AsyncOpenAI`) sobre a API Chat Completions, que é a que os servidores compatíveis implementam. `LLM_EVAL_JUDGE_BASE_URL` vazio usa a API da OpenAI; preenchido aponta para qualquer servidor compatível: vLLM, Ollama ou um gateway como o LiteLLM na frente de outros provedores. O mesmo código cobre o juiz na nuvem e o juiz hospedado pelo adotante, quando o conteúdo não pode sair da rede.
-- **Saída estruturada.** `response_format` com JSON schema em modo `strict`, o que dispensa parsear texto livre. Nem todo servidor compatível aceita: `LLM_EVAL_JUDGE_RESPONSE_FORMAT` cai para `json_object` ou `none`, e nesses modos o schema também vai descrito no prompt. Em todos os modos o serviço valida a resposta contra o schema antes de usar.
+- **Um adaptador, `openai`.** SDK oficial (`openai`, cliente `AsyncOpenAI`) sobre a API Chat Completions, que é a que os servidores compatíveis implementam. `LLM_EVAL_LLM_JUDGE_BASE_URL` vazio usa a API da OpenAI; preenchido aponta para qualquer servidor compatível: vLLM, Ollama ou um gateway como o LiteLLM na frente de outros provedores. O mesmo código cobre o juiz na nuvem e o juiz hospedado pelo adotante, quando o conteúdo não pode sair da rede.
+- **Saída estruturada.** `response_format` com JSON schema em modo `strict`, o que dispensa parsear texto livre. Nem todo servidor compatível aceita: `LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT` cai para `json_object` ou `none`, e nesses modos o schema também vai descrito no prompt. Em todos os modos o serviço valida a resposta contra o schema antes de usar.
 - **Término.** `message.refusal` preenchido ou `finish_reason` `content_filter` vira `error.type=judge_refusal`; `length` vira `judge_truncated`.
 - **Cache.** O prompt do juiz é fixo e vai primeiro, na mensagem de sistema, para formar um prefixo estável. A OpenAI aplica cache de prefixo automaticamente acima de um tamanho mínimo e informa `usage.prompt_tokens_details.cached_tokens`; a calibração confere se o cache pegou. Servidor que não informa o campo conta 0.
-- **Parâmetros opcionais.** Servidores e modelos divergem nos parâmetros que aceitam: modelos de raciocínio recusam `temperature`, e vários servidores recusam `reasoning_effort`. Os dois só vão na chamada quando configurados (`LLM_EVAL_JUDGE_TEMPERATURE`, `LLM_EVAL_JUDGE_REASONING_EFFORT`).
+- **Parâmetros opcionais.** Servidores e modelos divergem nos parâmetros que aceitam: modelos de raciocínio recusam `temperature`, e vários servidores recusam `reasoning_effort`. Os dois só vão na chamada quando configurados (`LLM_EVAL_LLM_JUDGE_TEMPERATURE`, `LLM_EVAL_LLM_JUDGE_REASONING_EFFORT`).
 - **Retentativas.** O SDK já repete 429 e 5xx; aqui fica com `max_retries=1` e timeout dentro do `timeout_s` do avaliador.
 
-**Modelo.** `LLM_EVAL_JUDGE_MODEL` é obrigatório quando um avaliador de juiz está habilitado. Sem padrão silencioso, porque o modelo define custo e qualidade. A calibração compara no mesmo conjunto pelo menos um modelo grande e um pequeno da API da OpenAI e um modelo aberto servido localmente pelo vLLM ou pelo Ollama, e registra concordância e custo por avaliação de cada um. A troca de modelo é decisão de quem opera, com esses números na mão. O ID do modelo é fixo, com versão ou data quando o provedor oferece, sem alias que mude por baixo.
+**Modelo.** `LLM_EVAL_LLM_JUDGE_MODEL` é obrigatório quando um avaliador de juiz está habilitado. Sem padrão silencioso, porque o modelo define custo e qualidade. A calibração compara no mesmo conjunto pelo menos um modelo grande e um pequeno da API da OpenAI e um modelo aberto servido localmente pelo vLLM ou pelo Ollama, e registra concordância e custo por avaliação de cada um. A troca de modelo é decisão de quem opera, com esses números na mão. O ID do modelo é fixo, com versão ou data quando o provedor oferece, sem alias que mude por baixo.
 
 **API de lotes.** A Batch API da OpenAI custa metade, mas devolve resultados de forma assíncrona e exigiria guardar o estado dos lotes pendentes. Isso contraria o requisito de serviço sem estado da spec. Fica fora da v0.3 e registrado como opção para um worker separado.
 
@@ -101,14 +101,14 @@ Para as heurísticas, o runner roda o avaliador mesmo num serviço liberado, par
 ### Privacidade do conteúdo enviado
 
 - **Mascaramento antes de enviar.** `find_pii` e `find_secrets` já devolvem posições. O texto vai ao juiz com cada ocorrência trocada pelo tipo (`[CPF]`, `[EMAIL]`, `[SECRET]`), o que preserva a estrutura para o julgamento. Ligado por padrão (`LLM_EVAL_JUDGE_REDACT=true`). Nomes e endereços não são mascarados até o `pii_ner` da v0.4.
-- **Juiz local.** O mesmo adaptador apontado para um servidor na rede do adotante (`LLM_EVAL_JUDGE_BASE_URL`) cobre quem não pode mandar conteúdo para fora.
+- **Juiz local.** O mesmo adaptador apontado para um servidor na rede do adotante (`LLM_EVAL_LLM_JUDGE_BASE_URL`) cobre quem não pode mandar conteúdo para fora.
 - **README.** Uma seção “o que sai para o provedor do juiz”, com o que é mascarado e o que não é.
 
 ### Explicação do juiz
 
 - O schema pede `reason` com no máximo 300 caracteres, e o prompt instrui a não citar o conteúdo. O serviço corta em 300 caracteres de qualquer forma e passa pelo sanitizador, que já existe para este caso.
 - O sanitizador pega PII e credenciais por regex, não nomes. Um nome citado na justificativa passa por ele. A v0.4 acrescenta a opção de passar a justificativa também pelo `pii_ner`.
-- `LLM_EVAL_JUDGE_EXPLANATION=false` troca a explicação por um template (`score=4/5`), para quem não quer texto livre na telemetria.
+- `LLM_EVAL_LLM_JUDGE_EXPLANATION=false` troca a explicação por um template (`score=4/5`), para quem não quer texto livre na telemetria.
 
 ### Ataque ao juiz
 
@@ -126,16 +126,16 @@ Configuração nova:
 
 | Variável | Padrão | Efeito |
 | --- | --- | --- |
-| `LLM_EVAL_JUDGE_MODEL` | vazio, obrigatório com juiz habilitado | ID do modelo |
-| `LLM_EVAL_JUDGE_BASE_URL` | vazio (API da OpenAI) | endpoint compatível com OpenAI, como vLLM, Ollama ou LiteLLM |
-| `LLM_EVAL_JUDGE_RESPONSE_FORMAT` | `json_schema` | `json_schema`, `json_object` ou `none`, conforme o que o servidor aceita |
-| `LLM_EVAL_JUDGE_TEMPERATURE` | vazio (não enviado) | `temperature` da chamada |
-| `LLM_EVAL_JUDGE_REASONING_EFFORT` | vazio (não enviado) | `reasoning_effort`, para modelos de raciocínio |
-| `LLM_EVAL_JUDGE_MAX_CONCURRENCY` | `8` | chamadas simultâneas ao juiz |
-| `LLM_EVAL_JUDGE_QUEUE_MAX` | `1000` | avaliações na faixa antes de descartar |
-| `LLM_EVAL_JUDGE_TOKENS_PER_MINUTE` | vazio (sem limite) | orçamento de tokens |
+| `LLM_EVAL_LLM_JUDGE_MODEL` | vazio, obrigatório com juiz habilitado | ID do modelo |
+| `LLM_EVAL_LLM_JUDGE_BASE_URL` | vazio (API da OpenAI) | endpoint compatível com OpenAI, como vLLM, Ollama ou LiteLLM |
+| `LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT` | `json_schema` | `json_schema`, `json_object` ou `none`, conforme o que o servidor aceita |
+| `LLM_EVAL_LLM_JUDGE_TEMPERATURE` | vazio (não enviado) | `temperature` da chamada |
+| `LLM_EVAL_LLM_JUDGE_REASONING_EFFORT` | vazio (não enviado) | `reasoning_effort`, para modelos de raciocínio |
+| `LLM_EVAL_LLM_JUDGE_MAX_CONCURRENCY` | `8` | chamadas simultâneas ao juiz |
+| `LLM_EVAL_LLM_JUDGE_QUEUE_MAX` | `1000` | avaliações na faixa antes de descartar |
+| `LLM_EVAL_LLM_JUDGE_TOKENS_PER_MINUTE` | vazio (sem limite) | orçamento de tokens |
 | `LLM_EVAL_JUDGE_REDACT` | `true` | mascara PII e credenciais antes de enviar |
-| `LLM_EVAL_JUDGE_EXPLANATION` | `true` | emite a justificativa do juiz como explicação |
+| `LLM_EVAL_LLM_JUDGE_EXPLANATION` | `true` | emite a justificativa do juiz como explicação |
 
 A credencial segue a variável padrão do SDK, `OPENAI_API_KEY`, montada como segredo. Servidores locais sem autenticação aceitam qualquer valor, mas o SDK exige que a variável exista.
 
@@ -210,7 +210,7 @@ No serviço:
 ## Testes
 
 - **Unitários.** Um `JudgeClient` falso e determinístico, para cobrir mascaramento, orçamento, descarte, recusa, saída inválida, timeout, exceção por serviço e o conteúdo dos spans do juiz. O motor é testado com um avaliador falso lento: faixa cheia, timeout, drenagem no desligamento e vazão das heurísticas.
-- **Adaptador.** O adaptador `openai` roda contra um servidor falso compatível com OpenAI em `tools/`, que responde de forma determinística e pode recusar `json_schema`, para cobrir os três modos de `LLM_EVAL_JUDGE_RESPONSE_FORMAT`. Como o adaptador é o mesmo para a OpenAI e para servidores locais, o teste exercita o código de produção.
+- **Adaptador.** O adaptador `openai` roda contra um servidor falso compatível com OpenAI em `tools/`, que responde de forma determinística e pode recusar `json_schema`, para cobrir os três modos de `LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT`. Como o adaptador é o mesmo para a OpenAI e para servidores locais, o teste exercita o código de produção.
 - **Ponta a ponta.** O mesmo servidor falso sobe no compose. O CI não precisa de chave de API. O README mostra como trocar pela OpenAI ou por um servidor local.
 - **Carga.** Com o juiz lento (5 s por chamada) e fora do ar, as heurísticas mantêm a vazão da v0.2.
 - **Vazamento.** O teste de vazamento passa a olhar também o que foi enviado ao juiz falso: nenhum CPF, cartão ou credencial dos casos sintéticos chega a ele com `LLM_EVAL_JUDGE_REDACT=true`.
@@ -222,10 +222,10 @@ No serviço:
 2. **Faixas de execução.** Faixa por `kind` com fila limitada, `llm_eval.evaluations.dropped`, `llm_eval.lane.size` e drenagem no desligamento.
    - Pronto quando: com um avaliador falso de 2 s, as heurísticas mantêm pelo menos 95% da vazão sem ele; a faixa cheia conta descarte sem gerar 429; e o timeout gera `error.type=timeout` sem afetar os outros avaliadores.
 3. **Cliente do juiz.** `JudgeClient`, adaptador `openai`, cliente falso, servidor falso compatível, spans e métricas do juiz sem conteúdo.
-   - Pronto quando: o adaptador passa nos testes contra o servidor falso nos três modos de `LLM_EVAL_JUDGE_RESPONSE_FORMAT`, recusa e saída inválida viram `error.type`, e o span do juiz não tem atributo de conteúdo.
+   - Pronto quando: o adaptador passa nos testes contra o servidor falso nos três modos de `LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT`, recusa e saída inválida viram `error.type`, e o span do juiz não tem atributo de conteúdo.
 4. **Faixa do juiz, orçamento e exceção.** Faixa `llm_judge`, semáforo, balde de tokens, descarte por `budget`, serviço liberado sem chamada.
    - Pronto quando: com orçamento esgotado as avaliações são descartadas e contadas, e serviço liberado não gera chamada ao juiz.
-5. **Mascaramento e explicação.** Mascaramento antes do envio, corte e sanitização da justificativa, `LLM_EVAL_JUDGE_EXPLANATION`.
+5. **Mascaramento e explicação.** Mascaramento antes do envio, corte e sanitização da justificativa, `LLM_EVAL_LLM_JUDGE_EXPLANATION`.
    - Pronto quando: o juiz falso nunca recebe os valores dos casos sintéticos, e uma justificativa que cita um CPF sai como `[REDACTED]`.
 6. **`relevance`.** Avaliador, prompt, schema, `tools/benchmark.py` e calibração.
    - Pronto quando: o avaliador passa no critério de aprovação da calibração com o modelo escolhido, e os números estão registrados.
@@ -253,12 +253,12 @@ No serviço:
 | Risco | Efeito | Mitigação |
 | --- | --- | --- |
 | Custo acima do previsto | Conta alta no provedor | `sample_rate` baixo, orçamento de tokens, `max_chars`, cache do prompt do juiz, custo por mil avaliações medido na calibração |
-| Conteúdo sensível enviado ao provedor | Exposição fora do perímetro | Mascaramento por padrão; juiz local por `LLM_EVAL_JUDGE_BASE_URL`; seção no README |
-| Servidor compatível diverge da API da OpenAI | Saída estruturada recusada, uso ausente, parâmetro rejeitado | `LLM_EVAL_JUDGE_RESPONSE_FORMAT`; validação local do schema em todos os modos; parâmetros opcionais só quando configurados; uso ausente fica na estimativa do orçamento |
+| Conteúdo sensível enviado ao provedor | Exposição fora do perímetro | Mascaramento por padrão; juiz local por `LLM_EVAL_LLM_JUDGE_BASE_URL`; seção no README |
+| Servidor compatível diverge da API da OpenAI | Saída estruturada recusada, uso ausente, parâmetro rejeitado | `LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT`; validação local do schema em todos os modos; parâmetros opcionais só quando configurados; uso ausente fica na estimativa do orçamento |
 | Descarte silencioso do juiz sob carga | Avaliações faltando no painel | `llm_eval.evaluations.dropped` com alerta sugerido no README |
 | Nota manipulada pelo conteúdo avaliado | Falso `pass` | Conteúdo delimitado, saída estruturada; cruzamento com `prompt_injection` a partir da v0.4 |
 | Provedor muda o comportamento do modelo | Notas mudam sem mudança no serviço | ID de modelo fixo, sem alias; `gen_ai.response.model` e `llm_eval.judge.model` no evento; recalibrar a cada troca |
-| Justificativa com nome ou dado não detectado por regex | Dado pessoal na telemetria | Corte em 300 caracteres; `LLM_EVAL_JUDGE_EXPLANATION=false`; sanitização por `pii_ner` na v0.4 |
+| Justificativa com nome ou dado não detectado por regex | Dado pessoal na telemetria | Corte em 300 caracteres; `LLM_EVAL_LLM_JUDGE_EXPLANATION=false`; sanitização por `pii_ner` na v0.4 |
 | `groupbytrace` segura muitos traces | Memória alta no Collector | Filtro só de inferência e retrieval antes do agrupamento; `num_traces` limitado |
 | Nomes de retrieval mudam na semconv (status Development) | `faithfulness` deixa de encontrar documentos | Nomes em `semconv.py`, teste de snapshot, motivo `no_retrieval_context` visível nas métricas |
 

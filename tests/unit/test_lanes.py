@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from conftest import OtelMemory, ServiceFactory
-from judge_fakes import FakeJudgeClient, chat, relevance
+from judge_fakes import FakeJudgeClient, FakeSystemOneClient, chat, jev_checks, relevance
 from opentelemetry._logs import SeverityNumber
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from otlp import chat_request
@@ -60,7 +60,7 @@ async def test_heuristics_do_not_wait_for_a_slow_judge(
     make_service: ServiceFactory, otel_memory: OtelMemory
 ) -> None:
     client = FakeJudgeClient(delay_s=2)
-    service = judge_service(make_service, client, judge_max_concurrency=2)
+    service = judge_service(make_service, client, llm_judge_max_concurrency=2)
     started = time.monotonic()
     for request in requests(20):
         service.ingest(request)
@@ -78,7 +78,9 @@ async def test_full_lane_drops_and_counts_without_429(
     make_service: ServiceFactory, otel_memory: OtelMemory
 ) -> None:
     client = FakeJudgeClient(delay_s=0.2)
-    service = judge_service(make_service, client, judge_queue_max=2, judge_max_concurrency=1)
+    service = judge_service(
+        make_service, client, llm_judge_queue_max=2, llm_judge_max_concurrency=1
+    )
     for request in requests(10):
         service.ingest(request)  # QueueFull would raise here
     await service.drain(10)
@@ -130,7 +132,7 @@ async def test_no_budget_drops_without_calling(
 ) -> None:
     client = FakeJudgeClient()
     # 100 tokens per minute: less than one call's output allowance.
-    service = judge_service(make_service, client, judge_tokens_per_minute=100)
+    service = judge_service(make_service, client, llm_judge_tokens_per_minute=100)
     for request in requests(3):
         service.ingest(request)
     await service.drain()
@@ -154,7 +156,7 @@ async def test_shutdown_counts_what_the_drain_timeout_left(
     make_service: ServiceFactory, otel_memory: OtelMemory
 ) -> None:
     service = judge_service(
-        make_service, FakeJudgeClient(delay_s=5), drain_timeout_s=0.2, judge_max_concurrency=1
+        make_service, FakeJudgeClient(delay_s=5), drain_timeout_s=0.2, llm_judge_max_concurrency=1
     )
     for request in requests(3):
         service.ingest(request)
@@ -187,16 +189,18 @@ async def test_lane_settles_the_budget_with_reported_usage() -> None:
     budget = TokenBudget(10_000)
     usage: list[JudgeCall] = []
 
-    async def execute(job: Job) -> EvaluationRecord:
-        return EvaluationRecord(
-            job.interaction,
-            "relevance",
-            "llm_judge",
-            EvaluationResult(1.0, "pass", None),
-            0,
-            1,
-            judge_calls=tuple(usage),
-        )
+    async def execute(job: Job) -> list[EvaluationRecord]:
+        return [
+            EvaluationRecord(
+                job.interaction,
+                "relevance",
+                "llm_judge",
+                EvaluationResult(1.0, "pass", None),
+                0,
+                1,
+                judge_calls=tuple(usage),
+            )
+        ]
 
     lane = Lane(
         "llm_judge",
@@ -227,15 +231,17 @@ async def test_lane_jobs_run_concurrently_up_to_the_limit() -> None:
     running = 0
     peak = 0
 
-    async def execute(job: Job) -> EvaluationRecord:
+    async def execute(job: Job) -> list[EvaluationRecord]:
         nonlocal running, peak
         running += 1
         peak = max(peak, running)
         await asyncio.sleep(0.05)
         running -= 1
-        return EvaluationRecord(
-            job.interaction, "r", "llm_judge", EvaluationResult(1, "pass", None), 0, 1
-        )
+        return [
+            EvaluationRecord(
+                job.interaction, "r", "llm_judge", EvaluationResult(1, "pass", None), 0, 1
+            )
+        ]
 
     lane = Lane("llm_judge", execute, lambda records: None, max_size=100, concurrency=3)
     job = Runner([], default_timeout_s=1).prepare(relevance(), chat())
@@ -245,3 +251,134 @@ async def test_lane_jobs_run_concurrently_up_to_the_limit() -> None:
     await lane.drain(5)
     await lane.stop()
     assert peak == 3
+
+
+# --- The jev_judge lane -----------------------------------------------------------------
+
+JEV_RATES = {
+    "relevance": 1.0,
+    "jev_relevance": 1.0,
+    "jev_refusal": 1.0,
+    "jev_toxicity": 1.0,
+    "jev_prompt_injection": 1.0,
+}
+
+
+def both_judges(
+    make_service: ServiceFactory,
+    judge: FakeJudgeClient,
+    jev: FakeSystemOneClient,
+    **overrides: object,
+) -> Service:
+    overrides.setdefault("sample_rates", JEV_RATES)
+    return make_service([PIIDetector(), relevance(judge), *jev_checks(jev)], **overrides)
+
+
+async def test_jev_lane_exists_only_with_jev_checks(make_service: ServiceFactory) -> None:
+    assert make_service([PIIDetector(), relevance()]).jev_lane is None
+    service = make_service([PIIDetector(), *jev_checks()])
+    assert service.jev_lane is not None
+    assert [lane.name for lane in service.lanes] == ["llm_judge", "jev_judge"]
+
+
+async def test_a_stuck_judge_does_not_drop_jev_checks(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    service = both_judges(
+        make_service,
+        FakeJudgeClient(delay_s=5),
+        FakeSystemOneClient(),
+        llm_judge_queue_max=1,
+        llm_judge_max_concurrency=1,
+        drain_timeout_s=1,
+    )
+    for request in requests(10):
+        service.ingest(request)
+    assert service.jev_lane is not None
+    assert await service.queue.drain(2) and await service.jev_lane.drain(2)
+    for name in JEV_RATES:
+        if name != "relevance":
+            assert len(otel_memory.events(EVENT, name=name)) == 10
+            assert otel_memory.counter(DROPPED, {"gen_ai.evaluation.name": name}) == 0
+    assert otel_memory.counter(DROPPED, {"gen_ai.evaluation.name": "relevance"}) >= 8
+    assert otel_memory.counter("llm_eval.lane.size", {"llm_eval.lane": "jev_judge"}) == 0
+
+
+async def test_a_stuck_jev_does_not_drop_the_judge(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    service = both_judges(
+        make_service,
+        FakeJudgeClient(),
+        FakeSystemOneClient(delay_s=5),
+        jev_judge_queue_max=1,
+        jev_judge_max_concurrency=1,
+    )
+    for request in requests(10):
+        service.ingest(request)
+    assert await service.queue.drain(2) and await service.judge_lane.drain(2)
+    assert len(otel_memory.events(EVENT, name="relevance")) == 10
+    assert otel_memory.counter(DROPPED, {"gen_ai.evaluation.name": "relevance"}) == 0
+    # Two jobs in the lane (one running, one queued), eight requests dropped: four checks each.
+    full = {"llm_eval.drop.reason": "lane_full"}
+    assert otel_memory.counter(DROPPED, {**full, "gen_ai.evaluation.name": "jev_refusal"}) == 8
+    assert otel_memory.counter(DROPPED, full) == 32
+    warnings = [r.message for r in otel_memory.caplog.records if r.levelname == "WARNING"]
+    assert warnings == ["jev_judge lane dropping evaluations (lane_full)"]
+    await service.stop_workers()
+    shutdown = {"llm_eval.drop.reason": "shutdown"}
+    assert otel_memory.counter(DROPPED, shutdown) == 8  # the two jobs, four checks each
+
+
+async def test_jev_budget_drops_the_whole_batch_without_calling(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    client = FakeSystemOneClient()
+    service = make_service(
+        [PIIDetector(), *jev_checks(client)],
+        sample_rates=JEV_RATES,
+        jev_judge_tokens_per_minute=100,
+    )
+    service.ingest(chat_request("Qual o horário?"))
+    await service.drain()
+    assert client.received == []
+    assert otel_memory.counter(DROPPED, {"llm_eval.drop.reason": "budget"}) == 4
+
+
+async def test_lane_settles_a_batch_once() -> None:
+    interaction = chat("x" * 400, "y" * 400)  # 200 tokens estimated
+    budget = TokenBudget(10_000)
+    checks = jev_checks()
+
+    async def execute(job: Job) -> list[EvaluationRecord]:
+        call = JudgeCall("typesafe", "jev", None, None, 0, 1, None, 90, 10)
+        return [
+            EvaluationRecord(
+                job.interaction,
+                e.name,
+                "llm_judge",
+                EvaluationResult(1.0, "pass", None),
+                0,
+                1,
+                judge_calls=(call,) if n == 0 else (),
+            )
+            for n, e in enumerate(job.evaluators)
+        ]
+
+    sunk: list[EvaluationRecord] = []
+    lane = Lane(
+        "jev_judge",
+        execute,
+        sunk.extend,
+        max_size=10,
+        concurrency=1,
+        budget=budget,
+        output_tokens=128,
+    )
+    job = Runner([], default_timeout_s=1).prepare_batch(checks, interaction)
+    lane.start()
+    lane.offer(job)
+    await lane.drain(1)
+    await lane.stop()
+    assert len(sunk) == 4
+    assert 9_895 <= budget.available <= 9_905  # 100 used, not the 200 + 4 x 128 reserved

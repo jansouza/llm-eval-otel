@@ -9,6 +9,7 @@ from llm_eval_otel.emit.emitter import Emitter
 from llm_eval_otel.emit.sanitize import REDACTED, sanitize
 from llm_eval_otel.engine.runner import EvaluationRecord
 from llm_eval_otel.evaluators.base import EvaluationResult, GenAIInteraction, Message
+from llm_eval_otel.judge.client import JudgeCall
 
 TRACE_ID = bytes.fromhex("4bf92f3577b34da6a3ce929d0e0e4736")
 SPAN_ID = bytes.fromhex("00f067aa0ba902b7")
@@ -230,3 +231,32 @@ def test_sanitize_redacts_new_pii_types() -> None:
         "pix": "pix 123e4567-e89b-42d3-a456-426614174000",
     }
     assert sanitize(values) == ({k: REDACTED for k in values}, 3)
+
+
+def test_judge_call_span_is_named_by_its_operation(otel_memory: OtelMemory) -> None:
+    calls = (
+        JudgeCall("openai", "gpt-5-mini", "api.openai.com", 443, 10, 20, finish_reason="stop"),
+        JudgeCall(
+            "typesafe",
+            "jev-1.13.0",
+            "api.typesafe.ai",
+            443,
+            10,
+            20,
+            "jev-1.13.0",
+            300,
+            8,
+            operation_name="system_one",
+        ),
+    )
+    rec = record(EvaluationResult(1.0, "pass", "p=0.10"), name="jev_toxicity")
+    Emitter(otel_memory.telemetry).emit(replace(rec, judge_calls=calls))
+    [chat] = otel_memory.spans("chat gpt-5-mini")
+    [system_one] = otel_memory.spans("system_one jev-1.13.0")
+    assert (chat.attributes or {})["gen_ai.operation.name"] == "chat"
+    assert (system_one.attributes or {})["gen_ai.operation.name"] == "system_one"
+    assert (system_one.attributes or {})["gen_ai.provider.name"] == "typesafe"
+    assert "gen_ai.response.finish_reasons" not in (system_one.attributes or {})
+    duration = "gen_ai.client.operation.duration"
+    assert otel_memory.histogram_count(duration, {"gen_ai.operation.name": "system_one"}) == 1
+    assert otel_memory.histogram_count(duration, {"gen_ai.operation.name": "chat"}) == 1

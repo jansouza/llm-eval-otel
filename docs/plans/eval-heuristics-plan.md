@@ -1,4 +1,4 @@
-# Plano — avaliadores v0.2
+# Plano — heurísticas locais
 
 30/09/2026 · Jan Souza
 

@@ -189,6 +189,7 @@ class EvaluatorKind(StrEnum):
     HEURISTIC = "heuristic"
     MODEL = "model"
     LLM_JUDGE = "llm_judge"
+    JEV_JUDGE = "jev_judge"
 
 @dataclass(frozen=True)
 class EvaluationResult:
@@ -210,7 +211,7 @@ class Evaluator(Protocol):
 
 Avaliadores são registrados pelo entry point `llm_eval.evaluators` no `pyproject.toml` e habilitados por `LLM_EVAL_EVALUATORS=pii_detection,...`. Um avaliador de terceiros entra instalando o pacote dele, sem alterar este repositório.
 
-O runner chama as heurísticas (`kind = heuristic`) em `asyncio.to_thread`, para que a ingestão e o 429 continuem respondendo enquanto a regex roda. Avaliadores que esperam I/O rodam direto no event loop. Os juízes (`kind = llm_judge`) não seguram o worker da fila: o runner os oferece à faixa de execução e segue (ver Avaliador `relevance`). Se `max_chars` estiver definido, o runner corta o texto antes de chamar o avaliador, nesta ordem: saída, entrada e instruções de sistema, e marca o evento com `llm_eval.content.truncated=true`; as heurísticas não têm limite e varrem o texto inteiro.
+O runner chama as heurísticas (`kind = heuristic`) em `asyncio.to_thread`, para que a ingestão e o 429 continuem respondendo enquanto a regex roda. Avaliadores que esperam I/O rodam direto no event loop. Os juízes (`kind = llm_judge` ou `jev_judge`) não seguram o worker da fila: o runner os oferece à faixa de execução e segue (ver Avaliador `relevance`). Se `max_chars` estiver definido, o runner corta o texto antes de chamar o avaliador, nesta ordem: saída, entrada e instruções de sistema, e marca o evento com `llm_eval.content.truncated=true`; as heurísticas não têm limite e varrem o texto inteiro.
 
 **O que é avaliado em cada span**
 
@@ -288,7 +289,7 @@ Varre o conteúdo descrito em O que é avaliado em cada span. Resultado: `score`
 
 **Avaliadores `refusal`, `system_prompt_leak` e `output_format` (0.2.0)**
 
-Entram por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-v0-2-plan.md](plans/eval-v0-2-plan.md); o resumo:
+Entram por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-heuristics-plan.md](plans/eval-heuristics-plan.md); o resumo:
 
 | Avaliador | `fail` quando | Score |
 | --- | --- | --- |
@@ -298,12 +299,12 @@ Entram por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-v
 
 **Avaliador `relevance` (0.3.0)**
 
-LLM-as-a-Judge, por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-v0-3-plan.md](plans/eval-v0-3-plan.md); o `faithfulness` do mesmo plano ficou para uma versão futura. O resumo:
+LLM-as-a-Judge, por opção em `LLM_EVAL_EVALUATORS`. O desenho completo está em [eval-llm-judge-plan.md](plans/eval-llm-judge-plan.md); o `faithfulness` do mesmo plano ficou para uma versão futura. O resumo:
 
 - **Pergunta.** A resposta atende ao que o usuário pediu? O juiz lê as mensagens de usuário novas no turno, as partes `text` da saída e até 4 mensagens de texto anteriores ao turno (`context_messages`, 1.000 caracteres cada). Aplica-se quando há mensagem de usuário no turno e texto na saída.
 - **Escala.** Nota de 1 a 5 com justificativa. Score `(nota - 1) / 4`; `pass` com nota 3 ou mais (limiar inicial, a calibrar). `sample_rate` 0.05, `max_chars` 16.000, `timeout_s` 30.
-- **Cliente.** SDK `openai` sobre a API Chat Completions, na API da OpenAI ou num servidor compatível (`LLM_EVAL_JUDGE_BASE_URL`: vLLM, Ollama, LiteLLM). Saída estruturada por JSON schema em modo strict, com `json_object` e `none` para servidores que não aceitam; a resposta é validada contra o schema em todos os modos. `LLM_EVAL_JUDGE_MODEL` é obrigatório, sem padrão.
-- **Faixa de execução.** Fila própria (`LLM_EVAL_JUDGE_QUEUE_MAX`) e chamadas simultâneas limitadas (`LLM_EVAL_JUDGE_MAX_CONCURRENCY`). Faixa cheia, orçamento de tokens esgotado (`LLM_EVAL_JUDGE_TOKENS_PER_MINUTE`) e desligamento descartam a avaliação e contam em `llm_eval.evaluations.dropped`, sem 429: a fila principal é que faz a contrapressão.
+- **Cliente.** SDK `openai` sobre a API Chat Completions, na API da OpenAI ou num servidor compatível (`LLM_EVAL_LLM_JUDGE_BASE_URL`: vLLM, Ollama, LiteLLM). Saída estruturada por JSON schema em modo strict, com `json_object` e `none` para servidores que não aceitam; a resposta é validada contra o schema em todos os modos. `LLM_EVAL_LLM_JUDGE_MODEL` é obrigatório, sem padrão.
+- **Faixa de execução.** Fila própria (`LLM_EVAL_LLM_JUDGE_QUEUE_MAX`) e chamadas simultâneas limitadas (`LLM_EVAL_LLM_JUDGE_MAX_CONCURRENCY`). Faixa cheia, orçamento de tokens esgotado (`LLM_EVAL_LLM_JUDGE_TOKENS_PER_MINUTE`) e desligamento descartam a avaliação e contam em `llm_eval.evaluations.dropped`, sem 429: a fila principal é que faz a contrapressão.
 - **Privacidade.** Antes do envio, o que `find_pii` e `find_secrets` detectam vira o tipo (`[CPF]`, `[EMAIL]`, `[SECRET]`). Nomes e endereços passam. O conteúdo vai em JSON dentro de `<conversation>…</conversation>`, com `<` escapado, e o prompt diz que tudo ali é dado, nunca instrução.
 - **Erros.** `judge_refusal` (recusa ou filtro do provedor), `judge_truncated` (`finish_reason=length`), `judge_invalid_output` (fora do schema), `timeout` e o nome da classe da exceção do SDK.
 
@@ -441,7 +442,7 @@ Nenhum valor sensível bruto sai do serviço, em nenhum sinal. Três camadas gar
 2. `emit/sanitize.py` repassa os detectores de PII e de credenciais em todo atributo string antes de chamar o SDK. Se casar, o valor vira `[REDACTED]` e `llm_eval.sanitizer.redactions` incrementa. Isso cobre avaliadores de terceiros, como um LLM-as-a-Judge que cite o texto na explicação.
 3. Logs do próprio serviço nunca incluem conteúdo de mensagem, e `error.type` usa o nome da classe da exceção, nunca a mensagem dela.
 
-Os juízes são a exceção declarada a duas dessas regras. O conteúdo sai do serviço para o provedor do juiz, mascarado antes do envio (`LLM_EVAL_JUDGE_REDACT`, ligado por padrão), e a explicação é texto livre do juiz: o prompt pede para não citar o conteúdo, o serviço corta em 300 caracteres e o sanitizador passa por ela. Um nome citado passa pelo sanitizador; `LLM_EVAL_JUDGE_EXPLANATION=false` troca a explicação por `score=4/5`.
+Os juízes são a exceção declarada a duas dessas regras. O conteúdo sai do serviço para o provedor do juiz, mascarado antes do envio (`LLM_EVAL_JUDGE_REDACT`, ligado por padrão), e a explicação é texto livre do juiz: o prompt pede para não citar o conteúdo, o serviço corta em 300 caracteres e o sanitizador passa por ela. Um nome citado passa pelo sanitizador; `LLM_EVAL_LLM_JUDGE_EXPLANATION=false` troca a explicação por `score=4/5`.
 
 ## Requisitos não funcionais
 
@@ -505,17 +506,17 @@ As variáveis `OTEL_*` são as padrão do SDK; as `LLM_EVAL_*` são do serviço.
 | `LLM_EVAL_DEDUP_TTL_S` | `600` | janela de deduplicação |
 | `LLM_EVAL_AUTH_TOKEN` | vazio | exige `Authorization: Bearer` quando definido |
 | `LLM_EVAL_TLS_CERT_FILE` e `LLM_EVAL_TLS_KEY_FILE` | vazio | ligam TLS no uvicorn quando os dois estão definidos |
-| `LLM_EVAL_JUDGE_MODEL` | vazio, obrigatório com juiz habilitado | ID do modelo do juiz |
-| `LLM_EVAL_JUDGE_BASE_URL` | vazio (API da OpenAI) | endpoint compatível com OpenAI, como vLLM, Ollama ou LiteLLM |
-| `LLM_EVAL_JUDGE_RESPONSE_FORMAT` | `json_schema` | `json_schema`, `json_object` ou `none`, conforme o que o servidor aceita |
-| `LLM_EVAL_JUDGE_TEMPERATURE` | vazio (não enviado) | `temperature` da chamada |
-| `LLM_EVAL_JUDGE_REASONING_EFFORT` | vazio (não enviado) | `reasoning_effort`, para modelos de raciocínio |
-| `LLM_EVAL_JUDGE_MAX_OUTPUT_TOKENS` | `1024` | `max_completion_tokens` da chamada, raciocínio incluído; também entra na estimativa do orçamento |
-| `LLM_EVAL_JUDGE_MAX_CONCURRENCY` | `8` | chamadas simultâneas ao juiz |
-| `LLM_EVAL_JUDGE_QUEUE_MAX` | `1000` | avaliações na faixa antes de descartar |
-| `LLM_EVAL_JUDGE_TOKENS_PER_MINUTE` | vazio (sem limite) | orçamento de tokens |
+| `LLM_EVAL_LLM_JUDGE_MODEL` | vazio, obrigatório com juiz habilitado | ID do modelo do juiz |
+| `LLM_EVAL_LLM_JUDGE_BASE_URL` | vazio (API da OpenAI) | endpoint compatível com OpenAI, como vLLM, Ollama ou LiteLLM |
+| `LLM_EVAL_LLM_JUDGE_RESPONSE_FORMAT` | `json_schema` | `json_schema`, `json_object` ou `none`, conforme o que o servidor aceita |
+| `LLM_EVAL_LLM_JUDGE_TEMPERATURE` | vazio (não enviado) | `temperature` da chamada |
+| `LLM_EVAL_LLM_JUDGE_REASONING_EFFORT` | vazio (não enviado) | `reasoning_effort`, para modelos de raciocínio |
+| `LLM_EVAL_LLM_JUDGE_MAX_OUTPUT_TOKENS` | `1024` | `max_completion_tokens` da chamada, raciocínio incluído; também entra na estimativa do orçamento |
+| `LLM_EVAL_LLM_JUDGE_MAX_CONCURRENCY` | `8` | chamadas simultâneas ao juiz |
+| `LLM_EVAL_LLM_JUDGE_QUEUE_MAX` | `1000` | avaliações na faixa antes de descartar |
+| `LLM_EVAL_LLM_JUDGE_TOKENS_PER_MINUTE` | vazio (sem limite) | orçamento de tokens |
 | `LLM_EVAL_JUDGE_REDACT` | `true` | mascara PII e credenciais antes de enviar |
-| `LLM_EVAL_JUDGE_EXPLANATION` | `true` | emite a justificativa do juiz como explicação |
+| `LLM_EVAL_LLM_JUDGE_EXPLANATION` | `true` | emite a justificativa do juiz como explicação |
 
 A credencial do juiz é a variável padrão do SDK, `OPENAI_API_KEY`.
 
@@ -593,7 +594,7 @@ async def test_pii_in_prompt_is_flagged_without_leaking(app, otel_memory):
 
 ## Roadmap de avaliadores
 
-Depois da v0.1, os avaliadores entram em três ondas: heurísticas locais ([v0.2](plans/eval-v0-2-plan.md)), LLM-as-a-Judge ([v0.3](plans/eval-v0-3-plan.md)) e classificadores locais ([v0.4](plans/eval-v0-4-plan.md)). Cada onda exige um pouco mais da arquitetura. Os modelos citados são candidatos, a validar em português antes de entrar.
+Depois da v0.1, os avaliadores entram em três ondas: heurísticas locais ([v0.2](plans/eval-heuristics-plan.md)), LLM-as-a-Judge ([v0.3](plans/eval-llm-judge-plan.md)) e classificadores locais ([v0.4](plans/eval-local-classifiers-plan.md)). Cada onda exige um pouco mais da arquitetura. Os modelos citados são candidatos, a validar em português antes de entrar. Fora das ondas, os checks [Jev-as-a-Judge](plans/eval-jev-judge-plan.md) usam o Jev, um modelo de decisão, como juiz.
 
 | Versão | Avaliador | Como | O que muda na arquitetura |
 | --- | --- | --- | --- |
@@ -602,6 +603,7 @@ Depois da v0.1, os avaliadores entram em três ondas: heurísticas locais ([v0.2
 | v0.2 (entregue) | `output_format` | valida a sintaxe do JSON se `gen_ai.output.type` = `json`; o schema fica para quando houver atributo com ele | idem |
 | v0.2 (entregue) | `refusal` | frases de recusa do modelo em português, inglês e espanhol, e `finish_reason=content_filter` | idem |
 | v0.3 (entregue em 0.3.0, sem calibração) | `relevance` | LLM-as-a-Judge: a resposta atende à pergunta? Juiz pelo SDK da OpenAI, na API da OpenAI ou num servidor compatível (vLLM, Ollama) | faixa de execução com fila própria; custo por token; `sample_rate` abaixo de 1.0; mascaramento antes do envio; sanitizador aplicado à explicação do juiz |
+| Jev (entregue em 0.4.0, experimental, sem calibração) | `jev_relevance`, `jev_refusal`, `jev_toxicity`, `jev_prompt_injection` | Jev, o modelo de decisão da TypeSafe, pela API System One: perguntas tipadas (Score e Noul) sobre o mesmo `state`, todas numa requisição por span | faixa `jev_judge` própria; o runner junta num job só os avaliadores com o mesmo `batch_key`; um registro por avaliador, com o `JudgeCall` só no primeiro; explicação só de template |
 | v0.3 (adiado) | `faithfulness` | LLM-as-a-Judge compara a resposta com os documentos recuperados | agrupar spans do mesmo trace, porque `gen_ai.retrieval.documents` fica no span de retrieval; `sample_rate` abaixo de 1.0 |
 | v0.4 | `prompt_injection` | classificador local pequeno; candidato: Llama Prompt Guard 2 (multilíngue) | faixa com workers dedicados ao modelo |
 | v0.4 | `toxicity` | classificador local; candidato: Detoxify multilíngue, que cobre português | idem |
@@ -609,6 +611,7 @@ Depois da v0.1, os avaliadores entram em três ondas: heurísticas locais ([v0.2
 
 - Jailbreak por regex fica fora de propósito: frases como “ignore previous instructions” deixam passar variações e geram alarme falso. Ele entra na v0.4, com classificador.
 - A interface da v0.1 já comporta a v0.3 e a v0.4: `kind`, `timeout_s`, `sample_rate` e `max_chars` cobrem modelos locais e juízes amostrados, sem mudar as heurísticas, que seguem em 100%.
+- `jev_toxicity` e `jev_prompt_injection` se sobrepõem a `toxicity` e `prompt_injection` da v0.4. Os nomes diferentes permitem rodar os dois e comparar no mesmo span.
 - `faithfulness` é a maior mudança: hoje cada span é avaliado sozinho, e esse avaliador precisa esperar o trace completo, com um buffer por TraceID e janela de tempo.
 - As chamadas do juiz geram spans GenAI próprios, sem conteúdo. A topologia já impede que voltem ao avaliador; como defesa extra, o extrator descarta spans com o `service.name` do próprio serviço (`self_telemetry`).
 
@@ -631,4 +634,4 @@ O serviço só avalia o que chega até ele. Três condições do lado de quem ad
 | Serviço liberado por engano em `LLM_EVAL_EXCEPTIONS` | Um vazamento real vira `exempt` e não gera alerta | Lista versionada e revisada como código; painel com o volume de `exempt` por serviço; o evento continua registrando o que foi encontrado |
 | O PII continua no span original, que segue para o backend | Dado sensível armazenado no backend de traces | Fora do escopo; um processador `transform` no pipeline do backend pode mascarar, em trabalho separado |
 | Loop de telemetria: as saídas do avaliador voltam para ele | Carga dobrada e avaliação de spans de avaliação | Receptor dedicado no Collector (porta 4319) cujo pipeline não exporta para o avaliador; spans do próprio serviço descartados como `self_telemetry` |
-| Conteúdo enviado ao provedor do juiz | Exposição fora do perímetro | Juiz só por opção e numa amostra; mascaramento de PII e credenciais por padrão; juiz local por `LLM_EVAL_JUDGE_BASE_URL`; nomes e endereços não são mascarados, o que está documentado no README |
+| Conteúdo enviado ao provedor do juiz | Exposição fora do perímetro | Juiz só por opção e numa amostra; mascaramento de PII e credenciais por padrão; juiz local por `LLM_EVAL_LLM_JUDGE_BASE_URL`; nomes e endereços não são mascarados, o que está documentado no README |

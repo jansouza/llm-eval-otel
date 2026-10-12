@@ -50,18 +50,28 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_summary_interval_s: float = 60.0  # one summary line per interval; 0 turns it off
 
-    # LLM-as-a-Judge. The API key is the SDK's own OPENAI_API_KEY.
-    judge_model: str | None = None  # required when a judge evaluator is enabled
-    judge_base_url: str | None = None  # None = the OpenAI API; else any compatible server
-    judge_response_format: Literal["json_schema", "json_object", "none"] = "json_schema"
-    judge_temperature: float | None = None  # sent only when set
-    judge_reasoning_effort: str | None = None  # sent only when set
-    judge_max_output_tokens: int = 1024
-    judge_max_concurrency: int = 8
-    judge_queue_max: int = 1000
-    judge_tokens_per_minute: int | None = None  # None = no budget
+    # Every judge (llm_judge and jev_judge): mask PII and secrets before sending.
     judge_redact: bool = True
-    judge_explanation: bool = True
+
+    # LLM-as-a-Judge. The API key is the SDK's own OPENAI_API_KEY.
+    llm_judge_model: str | None = None  # required when a judge evaluator is enabled
+    llm_judge_base_url: str | None = None  # None = the OpenAI API; else any compatible server
+    llm_judge_response_format: Literal["json_schema", "json_object", "none"] = "json_schema"
+    llm_judge_temperature: float | None = None  # sent only when set
+    llm_judge_reasoning_effort: str | None = None  # sent only when set
+    llm_judge_max_output_tokens: int = 1024
+    llm_judge_max_concurrency: int = 8
+    llm_judge_queue_max: int = 1000
+    llm_judge_tokens_per_minute: int | None = None  # None = no budget
+    llm_judge_explanation: bool = True
+
+    # The Jev checks (jev_*), over TypeSafe's System One API. The API key is the SDK's own
+    # TYPESAFE_API_KEY.
+    jev_judge_model: str | None = None  # required when a jev_* evaluator is enabled
+    jev_judge_base_url: str | None = None  # None = TypeSafe's API (or the SDK's TYPESAFE_BASE_URL)
+    jev_judge_max_concurrency: int = 16
+    jev_judge_queue_max: int = 1000
+    jev_judge_tokens_per_minute: int | None = None  # None = no budget
 
     @field_validator("evaluators", "association_exclude", "pii_types", mode="before")
     @classmethod

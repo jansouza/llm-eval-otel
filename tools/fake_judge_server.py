@@ -1,6 +1,8 @@
-"""A deterministic OpenAI-compatible judge server, for tests, the demo and the load test.
+"""A deterministic judge server, for tests, the demo and the load test.
 
-No model and no API key. ``POST /v1/chat/completions`` answers the relevance judge with
+No model and no API key. Two APIs on one port:
+
+``POST /v1/chat/completions`` (OpenAI-compatible) answers the relevance judge with
 ``{"reason", "score"}`` computed from the conversation the service sends:
 
 - 5 when the response shares a content word (4+ letters) with the request;
@@ -11,6 +13,14 @@ Markers in the user message force the edge cases: ``FAKE_JUDGE:refuse``,
 ``FAKE_JUDGE:content_filter``, ``FAKE_JUDGE:length``, ``FAKE_JUDGE:invalid`` and
 ``FAKE_JUDGE:no_usage``. With ``response_format`` ``json_schema`` or ``json_object`` the
 reply is bare JSON; with none, it comes in a Markdown fence, as small local models often do.
+
+``POST /v1/systemone`` (TypeSafe's System One, the Jev checks) answers each question about
+the ``state``: a score question with the same rating as above, placed on its levels; a noul
+question by keywords, chosen by what the question asks (a refusal, offensive content, an
+injection; see ``NOUL_KEYWORDS``). ``GET /v1/models`` lists one model. Markers in the state:
+``FAKE_JUDGE:invalid`` (an answer missing), ``FAKE_JUDGE:no_usage``, ``FAKE_JEV:overloaded``
+(529), ``FAKE_JEV:rate_limited`` (429) and ``FAKE_JEV:422`` (a validation error that echoes
+the state, as the real one may).
 
     python tools/fake_judge_server.py --port 8080
     python tools/fake_judge_server.py --delay 5            # a slow judge
@@ -50,6 +60,10 @@ def rate(user_content: str) -> tuple[int, str]:
         conversation = json.loads(match.group(1)) if match else None
     except ValueError:
         conversation = None
+    return rate_conversation(conversation)
+
+
+def rate_conversation(conversation: Any) -> tuple[int, str]:
     if not isinstance(conversation, dict):
         return 3, "fake judge: no conversation found"
     request = " ".join(conversation.get("request") or [])
@@ -112,6 +126,92 @@ def completion(request: dict[str, Any], seen_prompts: set[str]) -> tuple[int, di
     return 200, body
 
 
+# Noul questions, by a word in their instructions: the state field to read and what says yes.
+NOUL_KEYWORDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "refuse": ("response", (
+        "não posso", "nao posso", "não consigo ajudar", "não é possível ajudar",
+        "i can't", "i cannot", "i won't", "unable to help",
+    )),
+    "offensive": ("response", (
+        "idiota", "imbecil", "burro", "cala a boca", "idiot", "stupid", "moron", "shut up",
+    )),
+    "system prompt": ("request", (
+        "ignore", "esqueça suas instruções", "repita suas instruções", "system prompt",
+        "suas instruções", "your instructions", "you are now", "agora você é",
+    )),
+}  # fmt: skip
+NOUL_YES = 0.9
+NOUL_NO = 0.1
+
+
+def noul(question: dict[str, Any], state: Any) -> float:
+    instructions = str(question.get("instructions") or "").lower()
+    for topic, (field, words) in NOUL_KEYWORDS.items():
+        if topic in instructions:
+            texts = state.get(field) if isinstance(state, dict) else None
+            text = " ".join(texts or []).lower()
+            return NOUL_YES if any(word in text for word in words) else NOUL_NO
+    return NOUL_NO
+
+
+def score(question: dict[str, Any], state: Any) -> dict[str, Any]:
+    """The 1-5 rating on the question's levels: 0.8 on that level, the rest on its neighbors."""
+    levels = question.get("criteria") or [""]
+    top = len(levels) - 1
+    rating, _ = rate_conversation(state)
+    level = round((rating - 1) / 4 * top)
+    neighbors = [n for n in (level - 1, level + 1) if 0 <= n <= top]
+    probabilities = {n: 0.0 for n in range(top + 1)}
+    probabilities[level] = 0.8 if neighbors else 1.0
+    for n in neighbors:
+        probabilities[n] = 0.2 / len(neighbors)
+    return {
+        "type": "score",
+        "score": round(sum(n * p for n, p in probabilities.items()), 6),
+        "confidence": probabilities[level],
+        "legend": {str(n): levels[n] for n in range(top + 1)},
+        "probabilities": {str(n): p for n, p in probabilities.items()},
+    }
+
+
+def system_one(request: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    state = request.get("state")
+    questions = request.get("questions") or {}
+    marked = json.dumps(state, ensure_ascii=False)
+    if "FAKE_JEV:overloaded" in marked:
+        return 529, {"error": {"type": "overloaded_error", "message": "Overloaded"}}
+    if "FAKE_JEV:rate_limited" in marked:
+        return 429, {"error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}}
+    if "FAKE_JEV:422" in marked:
+        # A real validation error can quote the input: the service must never log it.
+        detail = [{"loc": ["body", "state"], "msg": "invalid state", "input": state}]
+        return 422, {"detail": detail}
+    answers: dict[str, Any] = {}
+    for qid, question in questions.items():
+        if question.get("type") == "score":
+            answers[qid] = score(question, state)
+        else:
+            answers[qid] = {"type": "noul", "noul": noul(question, state)}
+    if "FAKE_JUDGE:invalid" in marked and answers:
+        del answers[next(iter(answers))]
+    body: dict[str, Any] = {"model": request.get("model", "fake-jev"), "answers": answers}
+    input_tokens = len(json.dumps(request, ensure_ascii=False)) // 4 + 1
+    body["usage"] = (
+        {}
+        if "FAKE_JUDGE:no_usage" in marked
+        else {"input_tokens": input_tokens, "output_tokens": 2 * len(answers)}
+    )
+    return 200, body
+
+
+MODELS = {
+    "models": [
+        {"name": "jev-1.13.0", "description": "fake Jev", "release_date": "2026-09-15"},
+        {"name": "jev-latest", "description": "fake Jev", "release_date": "2026-09-15"},
+    ]
+}
+
+
 class FakeJudgeServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -132,9 +232,15 @@ class FakeJudgeServer(ThreadingHTTPServer):
         self.seen_prompts: set[str] = set()
 
     @property
-    def base_url(self) -> str:
+    def root_url(self) -> str:
+        """For the TypeSafe SDK, which adds /v1/... itself."""
         host, port = self.server_address[:2]
-        return f"http://{host!s}:{port}/v1"
+        return f"http://{host!s}:{port}"
+
+    @property
+    def base_url(self) -> str:
+        """For the openai SDK."""
+        return f"{self.root_url}/v1"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -145,17 +251,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
+        if status in (429, 529):
+            self.send_header("retry-after-ms", "10")  # keeps the SDK's one retry quick
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self) -> None:
         if self.path == "/healthz":
             self._send(200, {"status": "ok"})
+        elif self.path == "/v1/models":
+            self._send(200, MODELS)
         else:
             self._send(404, {"error": {"message": "not found"}})
 
     def do_POST(self) -> None:
-        if not self.path.endswith("/chat/completions"):
+        jev = self.path == "/v1/systemone"
+        if not jev and not self.path.endswith("/chat/completions"):
             self._send(404, {"error": {"message": "not found"}})
             return
         raw = self.rfile.read(int(self.headers.get("content-length", 0)))
@@ -169,11 +280,14 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError as exc:  # recording is for tests; keep answering without it
                     print(f"cannot record requests: {exc}", flush=True)
                     self.server.record_path = None
-            status, body = completion(request, self.server.seen_prompts)
+            if jev:
+                status, body = system_one(request)
+            else:
+                status, body = completion(request, self.server.seen_prompts)
         if self.server.delay_s:
             time.sleep(self.server.delay_s)
         response_format = (request.get("response_format") or {}).get("type")
-        if self.server.reject_json_schema and response_format == "json_schema":
+        if not jev and self.server.reject_json_schema and response_format == "json_schema":
             status, body = (
                 400,
                 {

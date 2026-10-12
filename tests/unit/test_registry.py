@@ -49,6 +49,13 @@ def test_builtin_evaluators_are_registered() -> None:
     names = registry.available()
     assert names["pii_detection"] == "llm_eval_otel.evaluators.pii:PIIDetector"
     assert names["secret_detection"] == "llm_eval_otel.evaluators.secrets:SecretDetector"
+    for name, cls in (
+        ("jev_relevance", "JevRelevance"),
+        ("jev_refusal", "JevRefusal"),
+        ("jev_toxicity", "JevToxicity"),
+        ("jev_prompt_injection", "JevPromptInjection"),
+    ):
+        assert names[name] == f"llm_eval_otel.evaluators.jev_checks:{cls}"
 
 
 def test_unknown_evaluator_fails_fast() -> None:

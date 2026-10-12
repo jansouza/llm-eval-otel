@@ -49,7 +49,7 @@ class JudgeEvaluator:
             settings, evaluator=self.name, timeout_s=self.timeout_s
         )
         self.redact = settings.judge_redact
-        self.explain_with_reason = settings.judge_explanation
+        self.explain_with_reason = settings.llm_judge_explanation
 
     def text(self, value: str) -> str:
         """Every evaluated text goes through here before it is sent."""

@@ -15,6 +15,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http==1.45.0",
     "openai==3.22.1",
     "python-dotenv==1.2.3",
+    "typesafe-sdk==0.7.2",
 ]
 
 [project.scripts]
@@ -28,6 +29,10 @@ refusal = "llm_eval_otel.evaluators.refusal:RefusalDetector"
 system_prompt_leak = "llm_eval_otel.evaluators.prompt_leak:SystemPromptLeakDetector"
 output_format = "llm_eval_otel.evaluators.output_format:OutputFormatValidator"
 relevance = "llm_eval_otel.evaluators.relevance:RelevanceJudge"
+jev_relevance = "llm_eval_otel.evaluators.jev_checks:JevRelevance"
+jev_refusal = "llm_eval_otel.evaluators.jev_checks:JevRefusal"
+jev_toxicity = "llm_eval_otel.evaluators.jev_checks:JevToxicity"
+jev_prompt_injection = "llm_eval_otel.evaluators.jev_checks:JevPromptInjection"
 
 [dependency-groups]
 dev = [

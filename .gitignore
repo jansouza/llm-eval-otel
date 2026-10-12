@@ -1,0 +1,30 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tool caches and reports
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Output of the Collector's file exporter in the compose demo and e2e test
+deploy/e2e-output/
+
+# Editors, OS and local agent settings
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/settings.local.json

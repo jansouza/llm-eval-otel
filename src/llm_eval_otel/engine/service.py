@@ -15,7 +15,7 @@ from llm_eval_otel.emit.sdk import Telemetry
 from llm_eval_otel.engine.activity import Activity
 from llm_eval_otel.engine.lanes import Lane, TokenBudget
 from llm_eval_otel.engine.queue import DedupCache, EvaluationQueue, QueueFull
-from llm_eval_otel.engine.runner import EvaluationRecord, Runner
+from llm_eval_otel.engine.runner import EvaluationRecord, Runner, lane_of
 from llm_eval_otel.evaluators.base import Evaluator, EvaluatorKind
 from llm_eval_otel.extract.genai import extract
 
@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 
 # Upper bound on dedup keys kept in memory, whatever the TTL.
 DEDUP_MAX_KEYS = 200_000
+# Reserved per Jev question on top of the state: its instructions and the (unbilled) answer.
+# The budget settles with the usage Jev reports.
+JEV_TOKENS_PER_QUESTION = 128
 
 
 @dataclass(frozen=True)
@@ -52,23 +55,27 @@ class Service:
             sample_rates=settings.sample_rates,
             exceptions=settings.exceptions,
         )
-        judge_lane = str(EvaluatorKind.LLM_JUDGE)
-        tokens_per_minute = settings.judge_tokens_per_minute
-        self.judge_lane = Lane(
-            judge_lane,
-            self.runner.execute,
-            self._sink,
-            max_size=settings.judge_queue_max,
-            concurrency=settings.judge_max_concurrency,
-            budget=TokenBudget(tokens_per_minute) if tokens_per_minute else None,
-            output_tokens=settings.judge_max_output_tokens,
-            on_drop=self._record_drop,
-            on_size_change=lambda delta: self.emitter.lane_size.add(
-                delta, {semconv.LLM_EVAL_LANE: judge_lane}
-            ),
+        self.judge_lane = self._lane(
+            str(EvaluatorKind.LLM_JUDGE),
+            max_size=settings.llm_judge_queue_max,
+            concurrency=settings.llm_judge_max_concurrency,
+            tokens_per_minute=settings.llm_judge_tokens_per_minute,
+            output_tokens=settings.llm_judge_max_output_tokens,
         )
-        self.runner.add_lane(EvaluatorKind.LLM_JUDGE, self.judge_lane)
+        # Drained in this order at shutdown, after the main queue that feeds them.
         self.lanes = [self.judge_lane]
+        # Apart from the judge lane: seconds-long judge calls would hold its workers and the
+        # Jev checks would be dropped as lane_full, and each lane has its own token budget.
+        self.jev_lane: Lane | None = None
+        if any(lane_of(e) == EvaluatorKind.JEV_JUDGE for e in evaluators):
+            self.jev_lane = self._lane(
+                str(EvaluatorKind.JEV_JUDGE),
+                max_size=settings.jev_judge_queue_max,
+                concurrency=settings.jev_judge_max_concurrency,
+                tokens_per_minute=settings.jev_judge_tokens_per_minute,
+                output_tokens=JEV_TOKENS_PER_QUESTION,
+            )
+            self.lanes.append(self.jev_lane)
         self.queue = EvaluationQueue(
             self.runner,
             self._sink,
@@ -80,6 +87,31 @@ class Service:
         self.accepting = False
         self.rejecting = False  # answering 429 because the queue is full
         self._summary_task: asyncio.Task[None] | None = None
+
+    def _lane(
+        self,
+        name: str,
+        *,
+        max_size: int,
+        concurrency: int,
+        tokens_per_minute: int | None,
+        output_tokens: int,
+    ) -> Lane:
+        lane = Lane(
+            name,
+            self.runner.execute,
+            self._sink,
+            max_size=max_size,
+            concurrency=concurrency,
+            budget=TokenBudget(tokens_per_minute) if tokens_per_minute else None,
+            output_tokens=output_tokens,
+            on_drop=self._record_drop,
+            on_size_change=lambda delta: self.emitter.lane_size.add(
+                delta, {semconv.LLM_EVAL_LANE: name}
+            ),
+        )
+        self.runner.add_lane(name, lane)
+        return lane
 
     def _sink(self, records: list[EvaluationRecord]) -> None:
         self.activity.add_records(records)

@@ -15,12 +15,12 @@ from collections.abc import Awaitable, Callable
 
 from llm_eval_otel import semconv
 from llm_eval_otel.engine.queue import Sink
-from llm_eval_otel.engine.runner import EvaluationRecord, Job, ref
+from llm_eval_otel.engine.runner import EvaluationRecord, Job, job_name, ref
 from llm_eval_otel.evaluators.base import GenAIInteraction
 
 log = logging.getLogger(__name__)
 
-Execute = Callable[[Job], Awaitable[EvaluationRecord]]
+Execute = Callable[[Job], Awaitable[list[EvaluationRecord]]]
 OnDrop = Callable[[str, str], None]  # (evaluation name, drop reason)
 
 # A rough token count for a reservation, settled later with the usage the server reports.
@@ -88,7 +88,7 @@ class Lane:
         max_size: int,
         concurrency: int,
         budget: TokenBudget | None = None,
-        output_tokens: int = 0,
+        output_tokens: int = 0,  # reserved per evaluator in a job, on top of the input
         on_drop: OnDrop | None = None,
         on_size_change: Callable[[int], None] | None = None,
     ) -> None:
@@ -120,11 +120,16 @@ class Lane:
         self._cleared(semconv.DROP_LANE_FULL, still_tight=self.size > self.max_size // 2)
         return True
 
+    def _count_drop(self, job: Job, reason: str) -> None:
+        """A batch job is one evaluation per evaluator in it, and so many drops."""
+        for evaluator in job.evaluators:
+            self._on_drop(evaluator.name, reason)
+
     def _drop(self, job: Job, reason: str) -> None:
         """One WARNING when drops start; each drop is DEBUG and counted in the summary."""
         log.debug(
             "%s %s: dropped from the %s lane (%s)",
-            job.evaluator.name,
+            job_name(job),
             ref(job.interaction),
             self.name,
             reason,
@@ -132,7 +137,7 @@ class Lane:
         if reason not in self._dropping:
             self._dropping.add(reason)
             log.warning("%s lane dropping evaluations (%s)", self.name, reason)
-        self._on_drop(job.evaluator.name, reason)
+        self._count_drop(job, reason)
 
     def _cleared(self, reason: str, *, still_tight: bool) -> None:
         # Cleared only with room to spare, so a lane hovering at its limit doesn't flap.
@@ -153,7 +158,7 @@ class Lane:
             try:
                 await self._process(job)
             except asyncio.CancelledError:
-                self._on_drop(job.evaluator.name, semconv.DROP_SHUTDOWN)
+                self._count_drop(job, semconv.DROP_SHUTDOWN)
                 raise
             except Exception as exc:
                 log.error("failed to process a %s job: %s", self.name, type(exc).__name__)
@@ -163,19 +168,27 @@ class Lane:
     async def _process(self, job: Job) -> None:
         reserved = 0
         if self.budget is not None:
-            reserved = estimate_tokens(job.evaluator_input, self.output_tokens)
+            reserved = estimate_tokens(
+                job.evaluator_input, self.output_tokens * len(job.evaluators)
+            )
             if not self.budget.reserve(reserved):
                 self._drop(job, semconv.DROP_BUDGET)
                 return
             self._cleared(
                 semconv.DROP_BUDGET, still_tight=self.budget.available < self.budget.capacity / 2
             )
-        record = await self.execute(job)
+        records = await self.execute(job)
         if self.budget is not None:
-            used = [u for call in record.judge_calls if (u := call.tokens_used) is not None]
+            # Once per job: a batch's call is on its first record only.
+            used = [
+                u
+                for record in records
+                for call in record.judge_calls
+                if (u := call.tokens_used) is not None
+            ]
             # Without reported usage, the estimate stands.
             self.budget.settle(reserved, sum(used) if used else reserved)
-        outcome = self.sink([record])
+        outcome = self.sink(records)
         if outcome is not None:
             await outcome
 
@@ -197,7 +210,7 @@ class Lane:
         while not self._queue.empty():
             job = self._queue.get_nowait()
             self._on_size_change(-1)
-            self._on_drop(job.evaluator.name, semconv.DROP_SHUTDOWN)
+            self._count_drop(job, semconv.DROP_SHUTDOWN)
             self._queue.task_done()
         if pending:
             # One line, not one per job: a backed-up lane can hold thousands.

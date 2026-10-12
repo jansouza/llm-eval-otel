@@ -5,8 +5,9 @@ import random
 from dataclasses import dataclass
 
 import pytest
+from judge_fakes import FakeSystemOneClient, chat, jev_checks
 
-from llm_eval_otel.engine.runner import Runner, sampled, truncate
+from llm_eval_otel.engine.runner import Job, Runner, lane_of, sampled, truncate
 from llm_eval_otel.evaluators.base import (
     EvaluationResult,
     EvaluatorKind,
@@ -224,3 +225,129 @@ async def test_exempt_judge_is_not_called() -> None:
     assert record.result.label == "exempt"
     assert record.result.explanation == "exempt service; not evaluated"
     assert record.result.score is None and record.end_ns == record.start_ns
+
+
+# --- Jev batches ------------------------------------------------------------------------
+
+JEV_NAMES = ["jev_relevance", "jev_refusal", "jev_toxicity", "jev_prompt_injection"]
+
+
+async def test_jev_checks_sampled_together_share_one_request() -> None:
+    client = FakeSystemOneClient()
+    runner = Runner(
+        jev_checks(client), default_timeout_s=5, sample_rates=dict.fromkeys(JEV_NAMES, 1.0)
+    )
+    records = await runner.run(chat())
+    assert [r.evaluator_name for r in records] == JEV_NAMES
+    [(_, questions)] = client.received
+    assert list(questions) == JEV_NAMES
+    # One call, on the first record only: one system_one span and one usage measurement.
+    assert [len(r.judge_calls) for r in records] == [1, 0, 0, 0]
+    assert all(r.result.attributes["llm_eval.judge.batch_size"] == 4 for r in records)
+    assert len({(r.start_ns, r.end_ns) for r in records}) == 1
+
+
+async def test_each_check_keeps_its_own_sample_rate() -> None:
+    rates = {
+        "jev_relevance": 0.5,
+        "jev_refusal": 0.2,
+        "jev_toxicity": 1.0,
+        "jev_prompt_injection": 0.0,
+    }
+    client = FakeSystemOneClient()
+    runner = Runner(jev_checks(client), default_timeout_s=5, sample_rates=rates)
+    rng = random.Random(11)
+    for _ in range(50):
+        trace_id = rng.randbytes(16)
+        client.received.clear()
+        records = await runner.run(chat(trace_id=trace_id))
+        expected = [name for name in JEV_NAMES if sampled(trace_id, rates[name])]
+        assert [r.evaluator_name for r in records] == expected
+        assert [list(q) for _, q in client.received] == [expected]  # always exactly one request
+
+
+async def test_exempt_check_stays_out_of_the_batch() -> None:
+    client = FakeSystemOneClient()
+    runner = Runner(
+        jev_checks(client),
+        default_timeout_s=5,
+        sample_rates=dict.fromkeys(JEV_NAMES, 1.0),
+        exceptions={"support-bot": ["jev_relevance"]},
+    )
+    records = {r.evaluator_name: r for r in await runner.run(chat())}
+    exempt = records["jev_relevance"].result
+    assert (exempt.label, exempt.explanation) == ("exempt", "exempt service; not evaluated")
+    assert records["jev_relevance"].judge_calls == ()
+    [(_, questions)] = client.received
+    assert list(questions) == JEV_NAMES[1:]
+    assert records["jev_refusal"].result.attributes["llm_eval.judge.batch_size"] == 3
+
+
+class TypeSafeRateLimitError(Exception):
+    pass
+
+
+async def test_a_jev_error_is_on_every_record_of_the_batch() -> None:
+    client = FakeSystemOneClient(raise_error=TypeSafeRateLimitError)
+    runner = Runner(
+        jev_checks(client), default_timeout_s=5, sample_rates=dict.fromkeys(JEV_NAMES, 1.0)
+    )
+    records = await runner.run(chat())
+    assert [r.result.error_type for r in records] == 4 * ["TypeSafeRateLimitError"]
+    [call] = records[0].judge_calls
+    assert call.error_type == "TypeSafeRateLimitError"
+
+
+async def test_a_batch_times_out_as_a_whole() -> None:
+    client = FakeSystemOneClient(delay_s=1)
+    checks = jev_checks(client)
+    for check in checks:
+        check.timeout_s = 0.05
+    runner = Runner(checks, default_timeout_s=5, sample_rates=dict.fromkeys(JEV_NAMES, 1.0))
+    records = await runner.run(chat())
+    assert [r.result.error_type for r in records] == 4 * ["timeout"]
+    assert records[0].judge_calls[0].error_type == "timeout"
+
+
+async def test_a_batch_cuts_its_input_once() -> None:
+    client = FakeSystemOneClient()
+    checks = jev_checks(client)
+    for check in checks:
+        check.max_chars = 10
+    runner = Runner(checks, default_timeout_s=5, sample_rates=dict.fromkeys(JEV_NAMES, 1.0))
+    records = await runner.run(chat("pergunta longa", "resposta longa"))
+    assert all(r.truncated for r in records)
+    [(state, _)] = client.received
+    assert state["response"] == ["resposta l"] and state["request"] == []
+
+
+def test_lane_is_the_kind_unless_the_evaluator_names_one() -> None:
+    assert lane_of(PIIDetector()) == "heuristic"
+    assert lane_of(FakeJudge()) == "llm_judge"
+    assert lane_of(jev_checks()[0]) == "jev_judge"
+
+
+@dataclass
+class Recorder:
+    jobs: list[Job]
+
+    def offer(self, job: Job) -> bool:
+        self.jobs.append(job)
+        return True
+
+
+async def test_jobs_go_to_the_lane_they_name_and_unknown_lanes_run_inline() -> None:
+    judge_lane, jev_lane = Recorder([]), Recorder([])
+    unknown = FakeJudge(name="elsewhere")
+    unknown.lane = "nonexistent"  # type: ignore[attr-defined]
+    runner = Runner(
+        [FakeJudge(), *jev_checks(), unknown],
+        default_timeout_s=5,
+        sample_rates=dict.fromkeys(JEV_NAMES, 1.0),
+    )
+    runner.add_lane("llm_judge", judge_lane)
+    runner.add_lane("jev_judge", jev_lane)
+    records = await runner.run(chat())
+    assert [r.evaluator_name for r in records] == ["elsewhere"]
+    assert [[e.name for e in job.evaluators] for job in judge_lane.jobs] == [["fake_judge"]]
+    assert [[e.name for e in job.evaluators] for job in jev_lane.jobs] == [JEV_NAMES]

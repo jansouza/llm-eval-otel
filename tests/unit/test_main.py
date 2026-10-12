@@ -18,8 +18,8 @@ def test_startup_log_lists_evaluators_and_config_without_secrets(
         log_startup(settings)
     lines = caplog.messages
     assert lines[0] == (
-        "evaluators available: output_format, pii_detection, refusal, relevance, secret_detection, "
-        "system_prompt_leak"
+        "evaluators available: jev_prompt_injection, jev_refusal, jev_relevance, jev_toxicity, "
+        "output_format, pii_detection, refusal, relevance, secret_detection, system_prompt_leak"
     )
     assert lines[1] == "evaluators enabled: pii_detection, refusal"
     assert lines[2].startswith("config: http_port=4318, evaluators=['pii_detection', 'refusal']")

@@ -14,7 +14,14 @@ from judge_fakes import FakeJudgeClient, relevance
 from llm_eval_otel.cli import evaluate, main
 
 CPF = "529.982.247-25"
-JUDGE_ENV = ("LLM_EVAL_JUDGE_MODEL", "LLM_EVAL_JUDGE_BASE_URL", "OPENAI_API_KEY")
+JUDGE_ENV = (
+    "LLM_EVAL_LLM_JUDGE_MODEL",
+    "LLM_EVAL_LLM_JUDGE_BASE_URL",
+    "OPENAI_API_KEY",
+    "LLM_EVAL_JEV_JUDGE_MODEL",
+    "LLM_EVAL_JEV_JUDGE_BASE_URL",
+    "TYPESAFE_API_KEY",
+)
 
 
 @pytest.fixture
@@ -39,9 +46,16 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 @pytest.fixture
 def judge_env(monkeypatch: pytest.MonkeyPatch, server: FakeJudgeServer) -> None:
-    monkeypatch.setenv("LLM_EVAL_JUDGE_MODEL", "fake-judge-1")
-    monkeypatch.setenv("LLM_EVAL_JUDGE_BASE_URL", server.base_url)
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_MODEL", "fake-judge-1")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_BASE_URL", server.base_url)
     monkeypatch.setenv("OPENAI_API_KEY", "test")
+
+
+@pytest.fixture
+def jev_env(monkeypatch: pytest.MonkeyPatch, server: FakeJudgeServer) -> None:
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_MODEL", "jev-1.13.0")
+    monkeypatch.setenv("LLM_EVAL_JEV_JUDGE_BASE_URL", server.root_url)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
 
 
 def results(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
@@ -147,7 +161,7 @@ def test_reads_dotenv(
     capsys: pytest.CaptureFixture[str], server: FakeJudgeServer, tmp_path: Path
 ) -> None:
     (tmp_path / ".env").write_text(
-        f"LLM_EVAL_JUDGE_MODEL=from-dotenv\nLLM_EVAL_JUDGE_BASE_URL={server.base_url}\nOPENAI_API_KEY=test\n"
+        f"LLM_EVAL_LLM_JUDGE_MODEL=from-dotenv\nLLM_EVAL_LLM_JUDGE_BASE_URL={server.base_url}\nOPENAI_API_KEY=test\n"
     )
     assert main(["-i", "Qual o horário?", "-o", "Das 9h às 18h."]) == 0
     assert server.requests[0]["model"] == "from-dotenv"
@@ -158,9 +172,9 @@ def test_environment_wins_over_dotenv(
 ) -> None:
     env = tmp_path / "judge.env"
     env.write_text(
-        f"LLM_EVAL_JUDGE_MODEL=from-dotenv\nLLM_EVAL_JUDGE_BASE_URL={server.base_url}\nOPENAI_API_KEY=test\n"
+        f"LLM_EVAL_LLM_JUDGE_MODEL=from-dotenv\nLLM_EVAL_LLM_JUDGE_BASE_URL={server.base_url}\nOPENAI_API_KEY=test\n"
     )
-    monkeypatch.setenv("LLM_EVAL_JUDGE_MODEL", "from-environment")
+    monkeypatch.setenv("LLM_EVAL_LLM_JUDGE_MODEL", "from-environment")
     assert main(["--env-file", str(env), "-i", "Qual o horário?", "-o", "Das 9h."]) == 0
     assert server.requests[0]["model"] == "from-environment"
 
@@ -168,10 +182,14 @@ def test_environment_wins_over_dotenv(
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
-        (["-i", "oi", "-o", "olá"], "relevance needs LLM_EVAL_JUDGE_MODEL"),
+        (["-i", "oi", "-o", "olá"], "relevance needs LLM_EVAL_LLM_JUDGE_MODEL"),
         (["-i", "oi"], "give --input and --output, or --jsonl"),
         (["-i", "oi", "-o", "olá", "-c", "system:x", "--dry-run"], "--context takes ROLE:TEXT"),
         (["-e", "nope", "-i", "oi", "-o", "olá"], "'nope' is not registered"),
+        (
+            ["-e", "jev_refusal", "-i", "oi", "-o", "olá"],
+            "jev_refusal needs LLM_EVAL_JEV_JUDGE_MODEL",
+        ),
         (["-e", "pii_detection", "-i", "oi", "-o", "olá", "--dry-run"], "needs a judge evaluator"),
         (["--env-file", "missing.env", "-i", "oi", "-o", "olá"], "missing.env not found"),
     ],
@@ -182,3 +200,44 @@ def test_usage_and_configuration_errors_exit_2(
     assert main(argv) == 2
     captured = capsys.readouterr()
     assert captured.out == "" and message in captured.err
+
+
+@pytest.mark.usefixtures("jev_env")
+def test_runs_a_jev_check(capsys: pytest.CaptureFixture[str], server: FakeJudgeServer) -> None:
+    argv = ["-e", "jev_refusal", "-i", "Me passe o endereço dele.", "-o", "Não posso ajudar."]
+    assert main(argv) == 0
+    [result] = results(capsys)
+    assert (result["label"], result["explanation"]) == ("fail", "p=0.90")
+    assert result["attributes"] == {
+        "llm_eval.judge.model": "jev-1.13.0",
+        "llm_eval.judge.probability": 0.9,
+        "llm_eval.judge.batch_size": 1,
+    }
+    [call] = result["judge_calls"]
+    assert call["operation"] == "system_one" and call["input_tokens"] > 0
+    [request] = server.requests
+    assert list(request["questions"]) == ["jev_refusal"]
+
+
+@pytest.mark.usefixtures("jev_env")
+def test_jev_error_exits_1(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["-e", "jev_toxicity", "-i", "oi", "-o", "olá FAKE_JEV:422"]) == 1
+    [result] = results(capsys)
+    assert result["error_type"] == "TypeSafeUnprocessableEntityError"
+
+
+def test_dry_run_shows_the_masked_state_and_questions(
+    capsys: pytest.CaptureFixture[str], server: FakeJudgeServer
+) -> None:
+    # No model and no API key: a dry run needs neither.
+    argv = ["-e", "jev_relevance", "-i", f"Meu CPF é {CPF}", "-o", "Anotado.", "--dry-run"]
+    assert main(argv) == 0
+    [result] = results(capsys)
+    assert result["state"] == {
+        "context": [],
+        "request": ["Meu CPF é [CPF]"],
+        "response": ["Anotado."],
+    }
+    question = result["questions"]["jev_relevance"]
+    assert question["type"] == "ScoreQuestion" and len(question["levels"]) == 5
+    assert server.requests == []

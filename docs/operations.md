@@ -7,11 +7,12 @@
   `sending_queue` on). Invalid payloads return 400 and are not retried.
 - **Losses on crash.** The queue lives in memory, so a crash loses what was queued. The original
   spans still reach your backend unchanged.
-- **Shutdown.** On SIGTERM the service stops accepting data, drains the queue and then the judge
-  lane, both within 30 s, then flushes the SDK. Judge evaluations still pending are counted in
-  `llm_eval.evaluations.dropped` with `llm_eval.drop.reason=shutdown`.
-- **The judge lane doesn't push back.** `/readyz` and the 429s look only at the main queue. A
-  backed-up judge drops evaluations (`lane_full`) instead of slowing the Collector down.
+- **Shutdown.** On SIGTERM the service stops accepting data, drains the queue, then the judge
+  lane, then the `jev_judge` lane, all within 30 s, then flushes the SDK. Judge evaluations still
+  pending are counted in `llm_eval.evaluations.dropped` with `llm_eval.drop.reason=shutdown`.
+- **The lanes don't push back.** `/readyz` and the 429s look only at the main queue. A
+  backed-up judge or Jev drops evaluations (`lane_full`) instead of slowing the Collector down,
+  and one lane backing up doesn't affect the other.
 - **Scaling.** Scale with replicas: regex work is bound by the GIL, so more workers do not add
   throughput. Deduplication is per instance, so a Collector retry that lands on a different
   replica can be evaluated twice. That only happens on retries. The Collector's `loadbalancing`
@@ -24,13 +25,15 @@
   ```
   last 60s: received=11400 queued=11380 skipped=duplicate:20 rejected=none | evaluations:
   pii_detection=11380 (fail:312,pass:11068) relevance=569 (error:3,fail:66,pass:500)
-  | judge_tokens=812345 | queue=12/10000 llm_judge=3/1000
+  | judge_tokens=812345 | queue=12/10000 llm_judge=3/1000 jev_judge=0/1000
   ```
+
+  `judge_tokens` adds up both judges; the `jev_judge` lane appears only when a `jev_*` check is on.
 
   The summary is a `WARNING` when the interval had rejected exports, evaluation errors or
   drops. State changes get one line each when they happen: the queue filling up (429s) and
   accepting again, an evaluator failing (3 errors in a row) and recovering, the judge lane
-  starting and stopping to drop (`lane_full`, `budget`). `DEBUG` adds a line per export batch,
+  starting and stopping to drop (`lane_full`, `budget`), and the same for the `jev_judge` lane. `DEBUG` adds a line per export batch,
   rejected export (peer address and status), interaction and evaluation (label or error,
   score, duration, judge calls and tokens). Lines carry counts, TraceID, SpanID and
   `service.name`, never content or explanations. `DEBUG` costs a few lines per span, so keep
@@ -78,3 +81,19 @@ happens after the run's last span, so it barely shows; with the judge down it al
 the run, about 9% of the heuristics' throughput at a 5% sample of 10 KB spans. In the slow runs,
 8 concurrent calls of 5 s could not keep up with 140 evaluations: the shutdown's 30 s drain
 finished 72 and counted 67 as `shutdown` drops, as designed.
+
+With the four `jev_*` checks on, measured on 2026-10-06 with version 0.4.0 on a different
+machine, with `tools/load_test.py --spans 3000 --text-kb 10 --jev fake|down` (one run each; each
+check at 0.1, so about 300 requests of four questions per run, against the fake server):
+
+| Heuristics' throughput | Spans/s | 429s | Jev drops |
+| --- | --- | --- | --- |
+| No judge (2,000 spans, same machine) | 198 | 0 | n/a |
+| Jev answering at once | 170 | 0 | 0 |
+| Jev unreachable (connection refused) | 173 | 0 | 0 |
+| `--judge down --judge-rate 0.5 --jev fake --jev-rate 0.5` (2,000 spans) | 101 | 0 | 0 |
+
+Each Jev request costs about 8 ms of CPU in the service for a 10 KB span: masking the state
+once, the SDK's encoding and decoding, and four events and five spans. The last row is a stress
+case, five times the default rates with the OpenAI judge down: no Jev-as-a-Judge check was dropped while
+`relevance` failed on every call, which is what the separate lane is for.

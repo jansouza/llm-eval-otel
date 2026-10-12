@@ -24,10 +24,10 @@ define use the `llm_eval.*` prefix, so they cannot collide with future `gen_ai.*
 | `gen_ai.evaluation.score.label` | `pass`, `fail` or `exempt` |
 | `gen_ai.evaluation.explanation` | `cpf=1 (input), email=1 (output)` |
 | `gen_ai.response.id`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model` | copied from the evaluated span |
-| `error.type` | `timeout`, `judge_refusal`, `judge_truncated`, `judge_invalid_output` or an exception class name (only on failure) |
+| `error.type` | `timeout`, `judge_refusal`, `judge_truncated`, `judge_invalid_output` or an exception class name, such as `TypeSafeRateLimitError` (only on failure) |
 | `llm_eval.source.service.name` | `service.name` of the app that produced the span |
 | `traceloop.association.properties.*` | copied from the evaluated span (OpenLLMetry), e.g. `scenario` |
-| `llm_eval.evaluation.type` | `heuristic`, `model` or `llm_judge` |
+| `llm_eval.evaluation.type` | `heuristic`, `model`, `llm_judge` or `jev_judge` |
 | `llm_eval.pii.types`, `llm_eval.secret.types` | `["cpf", "email"]` |
 | `llm_eval.refusal.source` | `phrase` or `finish_reason` |
 | `llm_eval.refusal.language` | `pt`, `en` or `es` (only with `source=phrase`) |
@@ -35,8 +35,11 @@ define use the `llm_eval.*` prefix, so they cannot collide with future `gen_ai.*
 | `llm_eval.prompt_leak.longest_run` | `37`: longest run of copied words |
 | `llm_eval.output_format.error` | `syntax`, `empty` or `truncated` (syntax error with `finish_reason=length`) |
 | `llm_eval.content.truncated` | `true` when the evaluator's `max_chars` cut the text |
-| `llm_eval.judge.model` | `gpt-5-mini-2025-08-07`: the model that answered (`relevance`) |
-| `llm_eval.judge.raw_score` | `4`: the judge's rating, 1 to 5 (`relevance`) |
+| `llm_eval.judge.model` | `gpt-5-mini-2025-08-07`: the model that answered (`relevance`, `jev_*`) |
+| `llm_eval.judge.raw_score` | `4`: the judge's rating, 1 to 5 (`relevance`); `2.6`: Jev's expected level, 0 to 4 (`jev_relevance`) |
+| `llm_eval.judge.confidence` | `0.82`: Jev's confidence in its score (`jev_relevance`) |
+| `llm_eval.judge.probability` | `0.93`: Jev's probability of "yes" (`jev_refusal`, `jev_toxicity`, `jev_prompt_injection`) |
+| `llm_eval.judge.batch_size` | `4`: how many `jev_*` checks shared the request |
 
 ## Judge spans
 
@@ -48,6 +51,12 @@ local server), `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
 `gen_ai.usage.cache_read.input_tokens`, `gen_ai.response.finish_reasons` and `error.type`.
 `gen_ai.input.messages` and `gen_ai.output.messages` are never set, and no instrumentation
 library wraps the SDK, because those can record content.
+
+Each Jev request is a `system_one {model}` span with the same attributes, except
+`gen_ai.operation.name=system_one` (the semconv allows a system's own operation name when none
+of its own fits), `gen_ai.provider.name=typesafe`, and no finish reason or cached tokens. One
+request answers every `jev_*` check sampled for the span, so the span hangs under the first
+check's `evaluate` span, and the `gen_ai.client.*` metrics count it once.
 
 ## Metrics
 
@@ -61,9 +70,9 @@ library wraps the SDK, because those can record content.
 | `llm_eval.queue.size` | UpDownCounter | none |
 | `llm_eval.sanitizer.redactions` | Counter | evaluation name |
 | `llm_eval.evaluations.dropped` | Counter | evaluation name, `llm_eval.drop.reason`: `lane_full`, `budget`, `shutdown` |
-| `llm_eval.lane.size` | UpDownCounter | `llm_eval.lane`: `llm_judge` |
-| `gen_ai.client.token.usage` | Histogram, `{token}` | `gen_ai.token.type` (`input`, `output`), evaluation name, provider, request and response model, server address and port |
-| `gen_ai.client.operation.duration` | Histogram, `s` | evaluation name, provider, request and response model, server address and port, `error.type` |
+| `llm_eval.lane.size` | UpDownCounter | `llm_eval.lane`: `llm_judge`, `jev_judge` (a request with several checks counts once) |
+| `gen_ai.client.token.usage` | Histogram, `{token}` | `gen_ai.token.type` (`input`, `output`), operation, evaluation name (the first check, for Jev), provider, request and response model, server address and port |
+| `gen_ai.client.operation.duration` | Histogram, `s` | operation, evaluation name, provider, request and response model, server address and port, `error.type` |
 
 `self_telemetry` counts spans whose `service.name` is the service's own: the evaluator's output
 routed back to it by mistake. They are never evaluated.

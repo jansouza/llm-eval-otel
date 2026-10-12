@@ -2,8 +2,8 @@
 
     uv run pytest tests/e2e -m e2e
 
-Needs Docker with the compose plugin, and no LLM API key: the relevance judge is the fake
-server in tools/. Set LLM_EVAL_IMAGE to test a prebuilt image.
+Needs Docker with the compose plugin, and no LLM API key: the relevance judge and the Jev
+checks answer from the fake server in tools/. Set LLM_EVAL_IMAGE to test a prebuilt image.
 """
 
 import json
@@ -34,7 +34,17 @@ EXPECTED_EVENTS = {
     "system_prompt_leak": 3,  # the leak case and the two JSON calls
     "output_format": 2,  # the two JSON calls
     "relevance": INFERENCE_SPANS - 2,  # sampled at 1.0; the tool call flow has no answer
+    # The Jev checks, all at 1.0. The tool call flow: the first call has the user's message
+    # but no text answer; the second has neither (only a tool result is new).
+    "jev_relevance": INFERENCE_SPANS - 2,
+    "jev_refusal": INFERENCE_SPANS - 2,
+    "jev_toxicity": INFERENCE_SPANS - 2,
+    "jev_prompt_injection": INFERENCE_SPANS - 1,
 }
+JEV_CHECKS = ("jev_relevance", "jev_refusal", "jev_toxicity", "jev_prompt_injection")
+# One System One request per span with at least one check: all but the second tool call.
+JEV_REQUESTS = INFERENCE_SPANS - 1
+JEV_MODEL = "jev-1.13.0"
 TOTAL_EVENTS = sum(EXPECTED_EVENTS.values())
 JUDGE_MODEL = "fake-judge-1"
 # PII and credentials: masked before the judge, and never in the output.
@@ -72,7 +82,7 @@ def attrs(items: list[dict[str, Any]] | None) -> dict[str, Any]:
 @dataclass
 class Output:
     raw: str = ""
-    judge_requests: str = ""
+    judge_requests: str = ""  # both APIs, one JSON request body per line
     events: list[dict[str, Any]] = field(default_factory=list)
     spans: list[dict[str, Any]] = field(default_factory=list)
     metrics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -105,6 +115,11 @@ class Output:
                     for metric in sm.get("metrics", []):
                         out.metrics.setdefault(metric["name"], []).append(metric)
         return out
+
+    def requests(self, key: str) -> list[dict[str, Any]]:
+        """The judge requests with this top-level key: messages (chat) or state (Jev)."""
+        parsed = [json.loads(line) for line in self.judge_requests.splitlines() if line.strip()]
+        return [r for r in parsed if key in r]
 
     def find(self, name: str, service: str) -> list[dict[str, Any]]:
         return [
@@ -195,6 +210,18 @@ def test_expected_labels(output: Output) -> None:
     assert sorted(labels["store-bot", "relevance"]) == ["fail", "pass"]
     assert labels["support-bot", "relevance"] == 8 * ["pass"]
     assert labels["bank-chatbot", "relevance"] == ["exempt"]
+    # The fake Jev: the same rating for jev_relevance, keywords for the other checks.
+    assert sorted(labels["store-bot", "jev_relevance"]) == ["fail", "pass"]
+    assert labels["support-bot", "jev_relevance"] == 8 * ["pass"]
+    assert labels["bank-chatbot", "jev_relevance"] == ["exempt"]
+    # The refusal case refuses, and the leak case asks to ignore the instructions.
+    assert sorted(labels["support-bot", "jev_refusal"]) == ["fail"] + 7 * ["pass"]
+    assert sorted(labels["support-bot", "jev_prompt_injection"]) == ["fail"] + 7 * ["pass"]
+    assert labels["support-bot", "jev_toxicity"] == 8 * ["pass"]
+    assert labels["devops-bot", "jev_prompt_injection"] == ["pass", "pass"]
+    # Exempt from jev_relevance only: the other checks still run for bank-chatbot.
+    for check in ("jev_refusal", "jev_toxicity", "jev_prompt_injection"):
+        assert labels["bank-chatbot", check] == ["pass"]
 
 
 def test_relevance_events(output: Output) -> None:
@@ -227,12 +254,62 @@ def test_judge_calls_are_spans_without_content(output: Output) -> None:
     assert "gen_ai.client.operation.duration" in output.metrics
 
 
+def test_jev_events(output: Output) -> None:
+    [off_topic] = [
+        e
+        for e in output.find("jev_relevance", "store-bot")
+        if e["attrs"]["gen_ai.evaluation.score.label"] == "fail"
+    ]
+    attrs = off_topic["attrs"]
+    assert attrs["gen_ai.evaluation.score.value"] == 0.05  # expected level 0.2 of 4
+    assert attrs["gen_ai.evaluation.explanation"] == "score=1.2/5 confidence=0.80"
+    assert attrs["llm_eval.judge.confidence"] == 0.8
+    assert attrs["llm_eval.judge.model"] == JEV_MODEL
+    assert attrs["llm_eval.judge.batch_size"] == 4
+    assert attrs["llm_eval.evaluation.type"] == "jev_judge"
+    [refused] = [
+        e
+        for e in output.find("jev_refusal", "support-bot")
+        if e["attrs"]["gen_ai.evaluation.score.label"] == "fail"
+    ]
+    assert refused["attrs"]["gen_ai.evaluation.explanation"] == "p=0.90"
+    assert refused["attrs"]["llm_eval.judge.probability"] == 0.9
+    assert refused["severityNumber"] == 13  # WARN
+    [exempt] = output.find("jev_relevance", "bank-chatbot")
+    assert exempt["attrs"]["gen_ai.evaluation.explanation"] == "exempt service; not evaluated"
+    for check in ("jev_refusal", "jev_toxicity", "jev_prompt_injection"):
+        [event] = output.find(check, "bank-chatbot")
+        assert event["attrs"]["llm_eval.judge.batch_size"] == 3
+
+
+def test_jev_calls_are_one_span_per_request(output: Output) -> None:
+    evaluate_spans = {
+        s["spanId"]: s for s in output.spans if s["name"] in {f"evaluate {c}" for c in JEV_CHECKS}
+    }
+    calls = [s for s in output.spans if s["name"] == f"system_one {JEV_MODEL}"]
+    assert len(calls) == JEV_REQUESTS
+    for call in calls:
+        assert call["parentSpanId"] in evaluate_spans
+        call_attrs = attrs(call.get("attributes"))
+        assert call_attrs["gen_ai.operation.name"] == "system_one"
+        assert call_attrs["gen_ai.provider.name"] == "typesafe"
+        assert call_attrs["server.address"] == "fake-judge"
+        assert call_attrs["gen_ai.usage.input_tokens"] > 0
+        assert not [k for k in call_attrs if k.startswith(("gen_ai.input", "gen_ai.output"))]
+
+
 def test_judge_received_no_detectable_value(output: Output) -> None:
     # One request per judged span: the exempt service's span never reached the judge.
-    assert len(output.judge_requests.splitlines()) == EXPECTED_EVENTS["relevance"] - 1
+    assert len(output.requests("messages")) == EXPECTED_EVENTS["relevance"] - 1
+    # One Jev request per span, every check sampled for it in the same request.
+    jev = output.requests("state")
+    assert len(jev) == JEV_REQUESTS
+    questions = [qid for r in jev for qid in r["questions"]]
+    assert len(questions) == sum(EXPECTED_EVENTS[c] for c in JEV_CHECKS) - 1  # one exempt
     for value in DETECTABLE:
         assert value not in output.judge_requests
-    assert "[CPF]" in output.judge_requests
+    assert "[CPF]" in json.dumps(output.requests("messages"), ensure_ascii=False)
+    assert "[CPF]" in json.dumps(jev, ensure_ascii=False)
 
 
 def test_new_evaluator_attributes(output: Output) -> None:
