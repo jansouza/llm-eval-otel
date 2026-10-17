@@ -1,8 +1,10 @@
 """The judge lane: the heuristics never wait for it, and what it can't run is counted."""
 
 import asyncio
+import logging
 import time
 
+import pytest
 from conftest import OtelMemory, ServiceFactory
 from judge_fakes import FakeJudgeClient, FakeSystemOneClient, chat, jev_checks, relevance
 from opentelemetry._logs import SeverityNumber
@@ -382,3 +384,59 @@ async def test_lane_settles_a_batch_once() -> None:
     await lane.stop()
     assert len(sunk) == 4
     assert 9_895 <= budget.available <= 9_905  # 100 used, not the 200 + 4 x 128 reserved
+
+
+def passing(job: Job) -> list[EvaluationRecord]:
+    return [
+        EvaluationRecord(job.interaction, "r", "llm_judge", EvaluationResult(1, "pass", None), 0, 1)
+    ]
+
+
+async def test_a_lane_that_drained_says_once_it_no_longer_drops(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def execute(job: Job) -> list[EvaluationRecord]:
+        return passing(job)
+
+    lane = Lane("llm_judge", execute, lambda records: None, max_size=2, concurrency=1)
+    job = Runner([], default_timeout_s=1).prepare(relevance(), chat())
+    with caplog.at_level(logging.INFO, logger="llm_eval_otel"):
+        assert lane.offer(job) and lane.offer(job)
+        assert not lane.offer(job)  # full, workers not started
+        lane.start()
+        await lane.drain(1)
+        assert lane.offer(job)  # room to spare again
+        await lane.drain(1)
+        await lane.stop()
+    assert "llm_judge lane dropping evaluations (lane_full)" in caplog.messages
+    assert "llm_judge lane no longer dropping evaluations (lane_full)" in caplog.messages
+
+
+async def test_a_failing_job_is_logged_and_the_lane_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+
+    async def execute(job: Job) -> list[EvaluationRecord]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("529.982.247-25")  # a message that could quote content
+        return passing(job)
+
+    sunk: list[EvaluationRecord] = []
+
+    async def sink(records: list[EvaluationRecord]) -> None:  # an async sink is awaited
+        await asyncio.sleep(0)
+        sunk.extend(records)
+
+    lane = Lane("llm_judge", execute, sink, max_size=10, concurrency=1)
+    job = Runner([], default_timeout_s=1).prepare(relevance(), chat())
+    lane.start()
+    lane.offer(job)
+    lane.offer(job)
+    assert await lane.drain(1)
+    await lane.stop()
+    assert "failed to process a llm_judge job: RuntimeError" in caplog.messages
+    assert "529.982.247-25" not in caplog.text
+    assert len(sunk) == 1

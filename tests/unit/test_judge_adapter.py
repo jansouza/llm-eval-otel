@@ -14,6 +14,7 @@ from typing import Any
 import openai
 import pytest
 from fake_judge_server import FakeJudgeServer
+from openai.types.chat import ChatCompletion
 
 from llm_eval_otel.config import Settings
 from llm_eval_otel.evaluators.relevance import SCHEMA, SYSTEM_PROMPT
@@ -26,7 +27,7 @@ from llm_eval_otel.judge.client import (
     recording,
 )
 from llm_eval_otel.judge.evaluator import envelope
-from llm_eval_otel.judge.openai_adapter import OpenAIJudge, ResponseFormat
+from llm_eval_otel.judge.openai_adapter import OpenAIJudge, ResponseFormat, parse_object
 
 MODEL = "gpt-5-mini-2025-08-07"
 CONTENT = envelope(
@@ -185,3 +186,26 @@ def test_openai_api_by_default() -> None:
 def test_from_settings_requires_a_model() -> None:
     with pytest.raises(JudgeConfigError):
         OpenAIJudge.from_settings(Settings(), evaluator="relevance", timeout_s=30)
+
+
+@pytest.mark.parametrize(
+    ("text", "parsed"),
+    [
+        ('```json\n{"score": 4}\n```', {"score": 4}),
+        ('{"score": 4', None),  # no closing brace
+        ("{score: 4}", None),  # braces, not JSON
+        ("", None),
+    ],
+)
+def test_parse_object_tolerates_prose_but_not_broken_json(text: str, parsed: Any) -> None:
+    assert parse_object(text) == parsed
+
+
+def test_a_completion_without_choices_is_invalid_output() -> None:
+    completion = ChatCompletion(
+        id="chatcmpl-1", choices=[], created=0, model="fake-judge-1", object="chat.completion"
+    )
+    with pytest.raises(JudgeInvalidOutput) as error:
+        OpenAIJudge._check(completion, SCHEMA)
+    assert error.value.response is not None
+    assert error.value.response.model == "fake-judge-1"

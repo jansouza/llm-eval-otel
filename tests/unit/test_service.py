@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import threading
+from dataclasses import dataclass
 
 import pytest
 from conftest import OtelMemory, ServiceFactory
@@ -25,6 +26,7 @@ from llm_eval_otel.config import Settings
 from llm_eval_otel.engine.queue import QueueFull
 from llm_eval_otel.engine.service import Service
 from llm_eval_otel.evaluators import registry
+from llm_eval_otel.evaluators.base import EvaluationResult, EvaluatorKind, GenAIInteraction
 from llm_eval_otel.evaluators.pii import PIIDetector
 from llm_eval_otel.evaluators.relevance import RelevanceJudge
 from llm_eval_otel.evaluators.secrets import SecretDetector
@@ -215,6 +217,35 @@ async def test_shutdown_drains_and_stops_accepting(
     assert len(otel_memory.events("gen_ai.evaluation.result")) == 20
     [summary] = [m for m in otel_memory.caplog.messages if m.startswith("last ")]
     assert "received=10 queued=10" in summary
+
+
+@dataclass
+class SlowInline:
+    """A judge-kind evaluator in a lane that doesn't exist, so it runs on the main queue."""
+
+    name: str = "slow_inline"
+    kind: EvaluatorKind = EvaluatorKind.LLM_JUDGE
+    lane: str = "nowhere"
+    timeout_s: float = 5.0
+    sample_rate: float = 1.0
+    max_chars: int | None = None
+
+    def applies_to(self, interaction: GenAIInteraction) -> bool:
+        return True
+
+    async def evaluate(self, interaction: GenAIInteraction) -> EvaluationResult:
+        await asyncio.sleep(1)
+        return EvaluationResult(1.0, "pass", None)
+
+
+async def test_drain_reports_a_timeout_on_the_main_queue(
+    make_service: ServiceFactory, otel_memory: OtelMemory
+) -> None:
+    service = make_service([SlowInline()], workers=1)
+    for n in range(2):
+        service.ingest(chat_request("oi", span_id=bytes([n + 1]) * 8))
+    assert not await service.drain(0.05)
+    assert "drain timed out with 1 interactions queued" in otel_memory.caplog.messages
 
 
 async def test_periodic_summary_counts_without_content(

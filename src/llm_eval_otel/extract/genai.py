@@ -361,15 +361,20 @@ def extract(
     for resource_spans in request.resource_spans:
         resource_attrs = attributes(resource_spans.resource.attributes)
         service_name = _as_str(resource_attrs.get(semconv.SERVICE_NAME))
+        own = self_service_name is not None and service_name == self_service_name
         for scope_spans in resource_spans.scope_spans:
             for span in scope_spans.spans:
-                result.received += 1
-                if self_service_name is not None and service_name == self_service_name:
-                    result.skipped[semconv.SKIP_SELF_TELEMETRY] += 1
-                    continue
-                outcome = extract_span(span, service_name)
-                if isinstance(outcome, str):
-                    result.skipped[outcome] += 1
-                else:
-                    result.interactions.append(outcome)
+                _add_span(result, span, service_name, own)
     return result
+
+
+def _add_span(result: ExtractResult, span: Span, service_name: str | None, own: bool) -> None:
+    result.received += 1
+    if own:
+        result.skipped[semconv.SKIP_SELF_TELEMETRY] += 1
+        return
+    outcome = extract_span(span, service_name)
+    if isinstance(outcome, str):
+        result.skipped[outcome] += 1
+    else:
+        result.interactions.append(outcome)

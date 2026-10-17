@@ -61,6 +61,39 @@ def _text(status: int, message: str, headers: dict[str, str] | None = None) -> R
     return Response(message, status_code=status, media_type="text/plain", headers=headers)
 
 
+def _encoding(request: Request) -> str:
+    return request.headers.get("content-encoding", "identity").strip().lower()
+
+
+def check_request(
+    request: Request, expected_auth: str | None, accepting: bool
+) -> tuple[int, str, dict[str, str] | None] | None:
+    """Why an export is refused before its body is read (status, message, headers), or None.
+
+    The checks run in this order: an unauthenticated peer gets 401 even during shutdown.
+    """
+    if expected_auth is not None and not hmac.compare_digest(
+        request.headers.get("authorization", "").encode(), expected_auth.encode()
+    ):
+        return 401, "unauthorized", None
+    if not accepting:
+        return 503, "shutting down", {"Retry-After": RETRY_AFTER_S}
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != PROTOBUF:
+        return 415, f"only {PROTOBUF} is supported", None
+    if _encoding(request) not in ("identity", "gzip"):
+        return 415, "only gzip content-encoding is supported", None
+    return None
+
+
+async def decode_export(request: Request, limit: int) -> ExportTraceServiceRequest:
+    """Read, gunzip and parse the body; raises PayloadTooLarge, BadEncoding or DecodeError."""
+    body = await read_body(request.stream(), limit)
+    if _encoding(request) == "gzip":
+        body = gunzip(body, limit)
+    return ExportTraceServiceRequest.FromString(body)
+
+
 def create_app(
     service: Service,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
@@ -80,26 +113,11 @@ def create_app(
 
     @app.post("/v1/traces")
     async def export_traces(request: Request) -> Response:
-        if expected_auth is not None and not hmac.compare_digest(
-            request.headers.get("authorization", "").encode(), expected_auth.encode()
-        ):
-            return _reject(request, 401, "unauthorized")
-        if not service.accepting:
-            return _reject(request, 503, "shutting down", {"Retry-After": RETRY_AFTER_S})
+        if (refusal := check_request(request, expected_auth, service.accepting)) is not None:
+            return _reject(request, *refusal)
 
-        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-        if content_type != PROTOBUF:
-            return _reject(request, 415, f"only {PROTOBUF} is supported")
-        encoding = request.headers.get("content-encoding", "identity").strip().lower()
-        if encoding not in ("identity", "gzip"):
-            return _reject(request, 415, "only gzip content-encoding is supported")
-
-        limit = settings.max_request_bytes
         try:
-            body = await read_body(request.stream(), limit)
-            if encoding == "gzip":
-                body = gunzip(body, limit)
-            export = ExportTraceServiceRequest.FromString(body)
+            export = await decode_export(request, settings.max_request_bytes)
         except PayloadTooLarge:
             return _reject(request, 413, "request too large")
         except (BadEncoding, DecodeError):

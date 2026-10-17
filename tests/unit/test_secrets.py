@@ -94,3 +94,7 @@ async def test_explanation_never_quotes_the_secret() -> None:
     assert result.attributes == {"llm_eval.secret.types": ["aws_access_key", "jwt"]}
     for fragment in (AWS, AWS[:8], AWS[-6:], JWT[:20]):
         assert fragment not in (result.explanation or "")
+
+
+def test_a_jwt_lookalike_whose_header_is_not_json_is_no_jwt() -> None:
+    assert find_secrets("id eyJzz.eyJabc.def") == []

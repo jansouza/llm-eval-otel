@@ -193,9 +193,10 @@ def test_sanitizer_redacts_third_party_explanation(otel_memory: OtelMemory) -> N
 
 
 def test_sanitize_leaves_clean_values() -> None:
-    clean, n = sanitize({"a": "cpf=1 (input)", "b": 1.0, "c": True, "d": ["cpf", "email"]})
+    values = {"a": "cpf=1 (input)", "b": 1.0, "c": True, "d": ["cpf", "email"], "e": [1, 5]}
+    clean, n = sanitize(values)
     assert n == 0
-    assert clean == {"a": "cpf=1 (input)", "b": 1.0, "c": True, "d": ["cpf", "email"]}
+    assert clean == values
 
 
 @pytest.mark.parametrize(

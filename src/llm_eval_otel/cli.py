@@ -103,23 +103,28 @@ def parse_context(value: str) -> dict[str, str]:
     return {"role": role, "text": text}
 
 
+def read_jsonl(path: str) -> list[dict[str, Any]]:
+    """One record per non-blank line of ``path``, or of stdin for ``-``."""
+    source = sys.stdin if path == "-" else Path(path).open()  # noqa: SIM115
+    with source:
+        lines = [line for line in source if line.strip()]
+    records = []
+    for number, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            raise UsageError(f"line {number} is not JSON") from None
+        if not isinstance(record, dict):
+            raise UsageError(f"line {number} is not a JSON object")
+        records.append(record)
+    return records
+
+
 def read_records(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.jsonl is not None:
         if args.input is not None or args.output is not None or args.context:
             raise UsageError("use either --jsonl or --input/--output/--context")
-        source = sys.stdin if args.jsonl == "-" else Path(args.jsonl).open()  # noqa: SIM115
-        with source:
-            lines = [line for line in source if line.strip()]
-        records = []
-        for number, line in enumerate(lines, start=1):
-            try:
-                record = json.loads(line)
-            except ValueError:
-                raise UsageError(f"line {number} is not JSON") from None
-            if not isinstance(record, dict):
-                raise UsageError(f"line {number} is not a JSON object")
-            records.append(record)
-        return records
+        return read_jsonl(args.jsonl)
     if args.input is None or args.output is None:
         raise UsageError("give --input and --output, or --jsonl")
     return [

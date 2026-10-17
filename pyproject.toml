@@ -40,6 +40,7 @@ dev = [
     "mypy==2.3.1",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
+    "pytest-cov>=7.1.0",
     "ruff==0.16.9",
     "types-protobuf==7.35.1.20260906",
 ]
@@ -83,3 +84,7 @@ testpaths = ["tests/unit"]
 # tools/fake_judge_server.py is imported by the judge adapter tests.
 pythonpath = ["tools"]
 markers = ["e2e: end-to-end test that needs docker compose"]
+
+[tool.coverage.report]
+# Script entry points, and the abstract methods of the judge base classes.
+exclude_also = ['if __name__ == "__main__":', "raise NotImplementedError"]

@@ -103,3 +103,8 @@ def test_normalization_ignores_case_accents_style_and_punctuation() -> None:
     system = words(SYSTEM)
     shouted = [w.upper() for w in system[:10]]
     assert overlap(system, [words(" ".join(shouted))]) == (3 / (len(system) - 7), 10)
+
+
+def test_instructions_shorter_than_an_ngram_overlap_nothing() -> None:
+    short = words("Seja breve.")
+    assert overlap(short, [short]) == (0.0, 0)

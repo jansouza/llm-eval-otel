@@ -167,3 +167,8 @@ def test_pii_types_default_to_all() -> None:
 def test_unknown_pii_type_fails_at_startup() -> None:
     with pytest.raises(ValueError, match="rg"):
         PIIDetector(types=["cpf", "rg"])
+
+
+def test_a_later_type_that_starts_before_a_kept_one_is_dropped() -> None:
+    # The e-mail starts before the CPF in its local part; the CPF, checked first, wins.
+    assert [(f.kind, f.start) for f in find_pii("a.529.982.247-25@x.com")] == [("cpf", 2)]
