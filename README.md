@@ -120,6 +120,21 @@ OPENAI_API_KEY=...
 `uv run llm-eval-judge -i "question" -o "answer"` tries a model before you enable it. See
 [docs/llm-as-a-judge.md](docs/llm-as-a-judge.md).
 
+## Code analysis (SonarQube)
+
+`sonar-project.properties` sets the sources, tests and coverage report. Generate the coverage,
+then run the scanner with the current branch and the version from `src/llm_eval_otel/version.py`:
+
+```sh
+export SONAR_TOKEN=...
+uv run pytest --cov=llm_eval_otel --cov-report=xml
+sonar-scanner \
+  -Dsonar.projectKey=llm-eval-otel \
+  -Dsonar.host.url=https://sonarqube.homelab.jansouza.com \
+  -Dsonar.branch.name="$(git branch --show-current)" \
+  -Dsonar.projectVersion="$(uv run python -c 'from llm_eval_otel.version import __version__; print(__version__)')"
+```
+
 ## Documentation
 
 - [Evaluators](docs/evaluators.md): what is evaluated, reading the results, writing an evaluator

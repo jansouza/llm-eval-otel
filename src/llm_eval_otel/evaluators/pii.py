@@ -269,7 +269,7 @@ class PIIDetector:
                     counts[finding.kind, location] += 1
         if not counts:
             return EvaluationResult(score=1.0, label=semconv.LABEL_PASS, explanation="no findings")
-        types = sorted({kind for kind, _ in counts})
+        types = sorted({key[0] for key in counts})  # keys are (kind, location)
         return EvaluationResult(
             score=0.0,
             label=semconv.LABEL_FAIL,

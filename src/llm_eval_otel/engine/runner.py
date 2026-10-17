@@ -138,8 +138,12 @@ def exempt(result: EvaluationResult) -> EvaluationResult:
         found = result.explanation
     else:
         found = "no findings"
-    return dataclasses.replace(
-        result, score=None, label=semconv.LABEL_EXEMPT, explanation=EXEMPT_PREFIX + found
+    return EvaluationResult(
+        score=None,
+        label=semconv.LABEL_EXEMPT,
+        explanation=EXEMPT_PREFIX + found,
+        attributes=result.attributes,
+        error_type=result.error_type,
     )
 
 

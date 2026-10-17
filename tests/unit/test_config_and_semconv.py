@@ -1,7 +1,9 @@
+import os
+
 import pytest
 
 from llm_eval_otel import semconv
-from llm_eval_otel.config import Settings
+from llm_eval_otel.config import OTEL_DEFAULTS, Settings, apply_otel_defaults
 
 
 def test_defaults() -> None:
@@ -87,6 +89,31 @@ def test_parses_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "devops-assistant": ["secret_detection"],
     }
     assert s.emit_spans is False
+
+
+@pytest.mark.parametrize(
+    ("value", "rates"),
+    [
+        ("", {}),
+        ("  ", {}),
+        ('{"relevance": 0.2, "jev_refusal": 1}', {"relevance": 0.2, "jev_refusal": 1.0}),
+    ],
+)
+def test_sample_rates_empty_or_json(
+    monkeypatch: pytest.MonkeyPatch, value: str, rates: dict[str, float]
+) -> None:
+    monkeypatch.setenv("LLM_EVAL_SAMPLE_RATES", value)
+    assert Settings().sample_rates == rates
+
+
+def test_otel_defaults_never_override_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in OTEL_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "llm-eval-otel-eu")
+    apply_otel_defaults()
+    assert os.environ["OTEL_SERVICE_NAME"] == "llm-eval-otel-eu"
+    assert os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://otel-collector:4319"
+    assert os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
 
 
 @pytest.mark.parametrize("value", ["", "  "])

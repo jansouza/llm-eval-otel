@@ -12,6 +12,7 @@ import threading
 from collections.abc import Iterator
 from typing import Any
 
+import httpx2
 import pytest
 import typesafe_sdk
 from fake_judge_server import FakeJudgeServer
@@ -235,3 +236,22 @@ def test_typesafe_api_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_from_settings_requires_a_model() -> None:
     with pytest.raises(JudgeConfigError, match="jev_refusal needs LLM_EVAL_JEV_JUDGE_MODEL"):
         TypeSafeJudge.from_settings(Settings(), evaluator="jev_refusal", timeout_s=5)
+
+
+async def test_a_response_the_sdk_cannot_validate_is_invalid_output(
+    server: FakeJudgeServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    judge = adapter(server)
+
+    async def unparsable(**request: Any) -> SDKResponse:
+        body = {"answers": "the state text, echoed back"}
+        raise typesafe_sdk.TypeSafeAPIResponseValidationError(
+            200, body, httpx2.Headers(), "answers"
+        )
+
+    monkeypatch.setattr(judge._client, "system_one", unparsable)
+    with recording() as calls, pytest.raises(JudgeInvalidOutput) as error:
+        await judge.ask(STATE, QUESTIONS)
+    assert error.value.__cause__ is None  # not chained: the SDK's error carries the body
+    [call] = calls
+    assert call.error_type == "judge_invalid_output"

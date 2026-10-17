@@ -30,6 +30,7 @@ from llm_eval_otel.judge.client import JudgeCall
 
 SCOPE = "llm_eval_otel"
 
+_EVALUATION_UNIT = "{evaluation}"
 _DURATION_BUCKETS = (0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
 
 # Attributes copied from the evaluated span onto metrics: bounded by apps and models.
@@ -135,7 +136,7 @@ class Emitter:
         meter = telemetry.meter_provider.get_meter(SCOPE)
 
         self.evaluations = meter.create_counter(
-            semconv.METRIC_EVALUATIONS, unit="{evaluation}", description="Evaluations run"
+            semconv.METRIC_EVALUATIONS, unit=_EVALUATION_UNIT, description="Evaluations run"
         )
         self.score = meter.create_histogram(
             semconv.METRIC_EVALUATION_SCORE,
@@ -165,11 +166,11 @@ class Emitter:
         )
         self.dropped = meter.create_counter(
             semconv.METRIC_EVALUATIONS_DROPPED,
-            unit="{evaluation}",
+            unit=_EVALUATION_UNIT,
             description="Evaluations sampled but not run: lane full, no token budget, shutdown",
         )
         self.lane_size = meter.create_up_down_counter(
-            semconv.METRIC_LANE_SIZE, unit="{evaluation}", description="Evaluations in a lane"
+            semconv.METRIC_LANE_SIZE, unit=_EVALUATION_UNIT, description="Evaluations in a lane"
         )
         self.client_token_usage = meter.create_histogram(
             semconv.METRIC_CLIENT_TOKEN_USAGE,

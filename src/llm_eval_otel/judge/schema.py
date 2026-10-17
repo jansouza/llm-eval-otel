@@ -43,12 +43,16 @@ def is_valid(value: Any, schema: Mapping[str, Any]) -> bool:
     if "maximum" in schema and value > schema["maximum"]:
         return False
     if isinstance(value, dict):
-        properties: Mapping[str, Any] = schema.get("properties", {})
-        if any(name not in value for name in schema.get("required", ())):
-            return False
-        if schema.get("additionalProperties") is False and set(value) - set(properties):
-            return False
-        return all(is_valid(value[name], sub) for name, sub in properties.items() if name in value)
+        return _object_ok(value, schema)
     if isinstance(value, list) and "items" in schema:
         return all(is_valid(item, schema["items"]) for item in value)
     return True
+
+
+def _object_ok(value: dict[str, Any], schema: Mapping[str, Any]) -> bool:
+    properties: Mapping[str, Any] = schema.get("properties", {})
+    if any(name not in value for name in schema.get("required", ())):
+        return False
+    if schema.get("additionalProperties") is False and set(value) - set(properties):
+        return False
+    return all(is_valid(value[name], sub) for name, sub in properties.items() if name in value)

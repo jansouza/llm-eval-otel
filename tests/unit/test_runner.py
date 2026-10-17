@@ -17,6 +17,7 @@ from llm_eval_otel.evaluators.base import (
 )
 from llm_eval_otel.evaluators.pii import PIIDetector
 from llm_eval_otel.evaluators.secrets import SecretDetector
+from llm_eval_otel.judge.jev import JevEvaluator
 
 
 def interaction(
@@ -296,6 +297,16 @@ async def test_a_jev_error_is_on_every_record_of_the_batch() -> None:
     assert [r.result.error_type for r in records] == 4 * ["TypeSafeRateLimitError"]
     [call] = records[0].judge_calls
     assert call.error_type == "TypeSafeRateLimitError"
+
+
+async def test_a_batch_must_return_one_result_per_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def short(cls: type, evaluators: object, interaction: object) -> list[EvaluationResult]:
+        return [EvaluationResult(1.0, "pass", None)]
+
+    monkeypatch.setattr(JevEvaluator, "evaluate_batch", classmethod(short))
+    runner = Runner(jev_checks(), default_timeout_s=5, sample_rates=dict.fromkeys(JEV_NAMES, 1.0))
+    records = await runner.run(chat())
+    assert [r.result.error_type for r in records] == 4 * ["ValueError"]
 
 
 async def test_a_batch_times_out_as_a_whole() -> None:

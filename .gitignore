@@ -18,6 +18,8 @@ dist/
 .coverage
 .coverage.*
 htmlcov/
+coverage.xml
+.scannerwork/
 
 # Output of the Collector's file exporter in the compose demo and e2e test
 deploy/e2e-output/

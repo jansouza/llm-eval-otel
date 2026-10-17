@@ -1,7 +1,6 @@
 """``secret_detection``: API keys, tokens, private keys and passwords in connection strings."""
 
 import base64
-import binascii
 import json
 import math
 import re
@@ -61,7 +60,7 @@ def _jwt_header_has_alg(token: str) -> bool:
     try:
         decoded = base64.urlsafe_b64decode(header + "=" * (-len(header) % 4))
         parsed = json.loads(decoded)
-    except (binascii.Error, ValueError):
+    except ValueError:  # binascii.Error and json.JSONDecodeError included
         return False
     return isinstance(parsed, dict) and "alg" in parsed
 
@@ -114,7 +113,7 @@ class SecretDetector:
                 counts[finding.kind, location] += 1
         if not counts:
             return EvaluationResult(score=1.0, label=semconv.LABEL_PASS, explanation="no findings")
-        types = sorted({kind for kind, _ in counts})
+        types = sorted({key[0] for key in counts})  # keys are (kind, location)
         return EvaluationResult(
             score=0.0,
             label=semconv.LABEL_FAIL,

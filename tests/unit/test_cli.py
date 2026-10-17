@@ -1,9 +1,11 @@
 """``llm-eval-judge`` against the fake OpenAI-compatible judge server; no API key needed."""
 
 import asyncio
+import io
 import json
 import threading
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,8 @@ import pytest
 from fake_judge_server import FakeJudgeServer
 from judge_fakes import FakeJudgeClient, relevance
 
-from llm_eval_otel.cli import evaluate, main
+from llm_eval_otel.cli import _Offline, evaluate, main, run
+from llm_eval_otel.evaluators.base import EvaluationResult, EvaluatorKind, GenAIInteraction
 
 CPF = "529.982.247-25"
 JUDGE_ENV = (
@@ -241,3 +244,75 @@ def test_dry_run_shows_the_masked_state_and_questions(
     question = result["questions"]["jev_relevance"]
     assert question["type"] == "ScoreQuestion" and len(question["levels"]) == 5
     assert server.requests == []
+
+
+@pytest.mark.parametrize(
+    ("lines", "message"),
+    [
+        (["{not json"], "line 1 is not JSON"),
+        (['{"input": "oi", "output": "olá"}', "[1, 2]"], "line 2 is not a JSON object"),
+        (['{"input": "oi"}'], "missing 'output'"),
+        (['{"input": 1, "output": "olá"}'], "'input' must be a string or a list of strings"),
+        (
+            ['{"input": "oi", "output": "olá", "context": [{"role": "system", "text": "x"}]}'],
+            'each context item needs "role" (user or assistant) and "text"',
+        ),
+    ],
+)
+def test_bad_jsonl_lines_exit_2(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, lines: list[str], message: str
+) -> None:
+    (tmp_path / "set.jsonl").write_text("\n".join(lines) + "\n\n")
+    assert main(["-e", "pii_detection", "--jsonl", "set.jsonl"]) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_jsonl_and_input_are_exclusive(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--jsonl", "set.jsonl", "-i", "oi"]) == 2
+    assert "use either --jsonl or --input/--output/--context" in capsys.readouterr().err
+
+
+def test_reads_jsonl_from_stdin(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = {"id": "a", "input": ["oi", f"CPF {CPF}"], "output": "ok"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(record) + "\n"))
+    assert main(["-e", "pii_detection", "--jsonl", "-", "--pretty"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert (result["id"], result["explanation"]) == ("a", "cpf=1 (input)")
+
+
+@dataclass
+class SlowEvaluator:
+    name: str = "slow"
+    kind: EvaluatorKind = EvaluatorKind.LLM_JUDGE
+    timeout_s: float = 0.05
+    sample_rate: float = 1.0
+    max_chars: int | None = None
+
+    def applies_to(self, interaction: GenAIInteraction) -> bool:
+        return True
+
+    async def evaluate(self, interaction: GenAIInteraction) -> EvaluationResult:
+        await asyncio.sleep(1)
+        return EvaluationResult(1.0, "pass", None)
+
+
+def test_timeout_is_an_error_result() -> None:
+    record = {"input": "oi", "output": "olá"}
+    result = asyncio.run(evaluate(SlowEvaluator(), record, 0, dry_run=False))
+    assert (result["error_type"], result["label"], result["score"]) == ("timeout", None, None)
+
+
+def test_dry_run_client_never_calls_the_judge() -> None:
+    with pytest.raises(RuntimeError, match="never calls"):
+        asyncio.run(_Offline().judge("system", "content", {}))
+    with pytest.raises(RuntimeError, match="never calls"):
+        asyncio.run(_Offline().ask({}, {}))
+
+
+def test_run_exits_with_main_s_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.argv", ["llm-eval-judge", "-i", "oi"])
+    with pytest.raises(SystemExit) as exit_info:
+        run()
+    assert exit_info.value.code == 2

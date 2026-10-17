@@ -26,7 +26,8 @@ FAIL_LONGEST_RUN: Final = 20  # words copied in a row
 FAIL_COVERAGE: Final = 0.15  # share of the instructions' 8-grams found in the output
 
 _OUTPUT_PARTS: Final = (semconv.PART_TEXT, semconv.PART_TOOL_CALL)
-_NOT_WORD = re.compile(r"[^\w\s]|_")
+# Also matches whitespace, which words() replaces with a space and splits on anyway.
+_NOT_WORD = re.compile(r"[\W_]")
 
 
 def words(text: str) -> list[str]:

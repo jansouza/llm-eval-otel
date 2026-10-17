@@ -1,5 +1,6 @@
 import json
 
+from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 from otlp import PARENT_SPAN_ID, SPAN_ID, TRACE_ID, make_request, make_span, semconv_attrs, text
 
 from llm_eval_otel.evaluators.base import Message, PartSpan
@@ -384,3 +385,37 @@ def test_spans_from_the_service_itself_are_skipped() -> None:
     assert len(extract(own).interactions) == 1  # only when the own name is known
     other = make_request(span, service_name="support-bot")
     assert len(extract(other, "llm-eval-otel").interactions) == 1
+
+
+def test_malformed_semconv_content_is_tolerated() -> None:
+    attrs = semconv_attrs(
+        [
+            "not a message",
+            {"role": "user", "parts": ["not a part", {"type": "text", "content": "oi"}]},
+        ],
+        [text("assistant", "olá")],
+    )
+    span = make_span(attrs)
+    span.attributes.append(KeyValue(key="gen_ai.response.model", value=AnyValue()))  # no value
+    i = only(make_request(span))
+    assert i.input_messages == [Message("user", "oi")]
+    assert i.output_messages == [Message("assistant", "olá")]
+
+
+def test_input_messages_that_are_not_json_are_no_content() -> None:
+    attrs = semconv_attrs([], [text("assistant", "olá")])
+    attrs["gen_ai.input.messages"] = "[not json"
+    i = only(make_request(make_span(attrs)))
+    assert i.input_messages == []
+    assert i.output_messages == [Message("assistant", "olá")]
+
+
+def test_system_instructions_as_messages_are_read_too() -> None:
+    system = [{"role": "system", "parts": [{"type": "text", "content": "Seja breve."}]}]
+    i = only(make_request(make_span(semconv_attrs([text("user", "oi")], system=system))))
+    assert [(m.role, m.text) for m in i.system_instructions] == [("system", "Seja breve.")]
+
+
+def test_openllmetry_content_that_looks_like_json_but_is_not_stays_as_is() -> None:
+    i = only(make_request(make_span(openllmetry_attrs([("user", "[{oops")], []))))
+    assert i.input_messages == [Message("user", "[{oops")]

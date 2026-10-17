@@ -7,6 +7,27 @@ detection. See [Versioning](docs/development.md#versioning).
 
 ## [Unreleased]
 
+## [0.4.1]
+
+No change to what gets detected.
+
+### Added
+
+- SonarQube analysis: `sonar-project.properties` (sources, tests, the `coverage.xml` from
+  `pytest-cov`) and the scanner command in the README.
+- Unit tests for the paths the suite didn't reach (the entry point, the SDK providers, the
+  judge output schema, malformed spans, drain timeouts, failing jobs), up to 100% line
+  coverage.
+
+### Changed
+
+- Refactors for the SonarQube findings
+  ([#3](https://github.com/jansouza/llm-eval-otel/issues/3) to
+  [#12](https://github.com/jansouza/llm-eval-otel/issues/12)): the four functions over the
+  cognitive complexity limit are split, the `{evaluation}` metric unit is a constant, and the
+  `exempt` result, the findings `Counter` iteration, a redundant `except` class and the
+  prompt-leak word regex are written the way the analyzer expects, with the same behavior.
+
 ## [0.4.0]
 
 ### Added

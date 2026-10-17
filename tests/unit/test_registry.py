@@ -7,6 +7,7 @@ from conftest import OtelMemory, ServiceFactory
 from otlp import chat_request
 
 from llm_eval_otel.evaluators import registry
+from llm_eval_otel.evaluators.base import EvaluationResult, EvaluatorKind
 
 EXAMPLE_MODULE = """
 from llm_eval_otel.evaluators.base import EvaluationResult, EvaluatorKind
@@ -61,6 +62,37 @@ def test_builtin_evaluators_are_registered() -> None:
 def test_unknown_evaluator_fails_fast() -> None:
     with pytest.raises(registry.EvaluatorLoadError, match="not registered"):
         registry.load(["nope"])
+
+
+class Unnamed:
+    """Implements the protocol, under another name than its entry point."""
+
+    name = "something_else"
+    kind = EvaluatorKind.HEURISTIC
+    timeout_s = 1.0
+    sample_rate = 1.0
+    max_chars = None
+
+    def applies_to(self, interaction: object) -> bool:
+        return True
+
+    async def evaluate(self, interaction: object) -> EvaluationResult:
+        return EvaluationResult(1.0, "pass", None)
+
+
+@pytest.mark.parametrize(
+    ("loaded", "message"),
+    [
+        (object, "does not implement Evaluator"),
+        (Unnamed, "returned an evaluator named 'something_else'"),
+    ],
+)
+def test_entry_point_must_return_an_evaluator_under_its_name(
+    monkeypatch: pytest.MonkeyPatch, loaded: type, message: str
+) -> None:
+    monkeypatch.setattr(registry, "factory", lambda name: loaded)
+    with pytest.raises(registry.EvaluatorLoadError, match=message):
+        registry.load(["example"])
 
 
 @pytest.mark.usefixtures("example_package")
